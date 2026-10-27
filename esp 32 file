@@ -1,0 +1,2410 @@
+/*
+ ==============================================================================
+  AEGIS RIDE : SMART VEHICLE SAFETY & ROAD CONDITION TELEMETRY
+  BREADBOARD DEMO BUILD (v4.1)          Target: ESP32 Dev Module / NodeMCU-32S
+  No external libraries needed.
+
+  Wiring:
+   MPU-6050  : VCC 3.3V, GND, SCL->22, SDA->21
+   OLED 0x3C : VDD 3.3V, GND, SCK->22, SDA->21
+   NEO-6M GPS: VCC->VIN(5V), GND, TX->GPIO16 (ESP32 RX2), RX->GPIO17 (ESP32 TX2)
+   Buzzer    : (+)->GPIO25, (-)->GND
+   Button    : GPIO4 <-> GND (internal pull-up & capacitive touch)
+               * NOTE: Changed from GPIO15 to GPIO4. GPIO15 is an ESP32 strapping
+                 pin with an onboard pull-down resistor on many dev boards,
+                 causing buttons to stay LOW.
+                 GPIO4 also supports Capacitive Touch! If you touch the GPIO4 wire
+                 with your finger, it triggers the button.
+                 If you still wish to use GPIO15, change PIN_BUTTON to 15 below.
+   Tactile Switch Connection:
+     Connect DIAGONALLY OPPOSITE pins across the tactile switch between GPIO4
+     and GND. (Do NOT connect adjacent pins on the same side).
+
+  BUTTON CONTROLS:
+   - 1 CLICK (Single Click): See LAST EVENT on OLED
+   - 2 CLICKS (Double Click): See RECENT LOG, COUNTS & STATUS on OLED
+   - 3 CLICKS (Triple Click): Start 15-SECOND SOS COUNTDOWN with warning beeps
+   - PRESS DURING COUNTDOWN: IMMEDIATELY TURNS OFF the alarm (Rider safe - No SOS)
+   - PRESS AFTER SOS DISPATCH: Dismisses alert & re-arms the system
+
+  ROAD TELEMETRY & FORCE THRESHOLDS:
+   - POTHOLE: MINOR = 1.50 G | MEDIUM = 2.20 G | SEVERE = 3.20 G
+   - SPEED BREAKER / BUMP: Tilt >= 25 deg held for 0.4s
+   - CRASH: Impact >= 4.00 G AND Tilt >= 45 deg within 2.5s
+            -> Starts 15-second countdown. Press button to turn off!
+
+  NETWORK LIMITATION:
+   - Phone connected ONLY to this ESP32 access point = local dashboard works.
+   - WhatsApp needs the ESP32 to ALSO join an internet-enabled router/SECOND hotspot.
+   - The ESP32 AP cannot pass the phone's mobile data back to the ESP32 by itself.
+
+  REMOTE EMERGENCY SOS OPTIONS (Wi-Fi & Bluetooth):
+   1. WI-FI EMERGENCY WEB DASHBOARD (No App Needed!):
+      - Connect smartphone to Wi-Fi: "AEGIS-RIDE-SAFETY" (Password: 12345678)
+      - Open browser to: http://192.168.4.1
+      - Tap the BIG RED "TRIGGER SOS" button or GREEN "CANCEL" button!
+      - View live telemetry and Google Maps location link.
+   2. BLUETOOTH SERIAL ("AEGIS-RIDE-SOS"):
+      - Pair with phone (Serial Bluetooth Terminal app).
+      - Send "sos", "cancel", "info", "status", "cal".
+      - When crash occurs or SOS triggers, emergency text + Google Maps link
+        is sent directly over Bluetooth to the paired phone.
+   3. TELEGRAM AUTO-DISPATCH:
+      - Uses only TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID; no CallMeBot needed.
+
+  Arduino IDE Settings:
+   - Board: "ESP32 Dev Module"
+   - Partition Scheme: "Huge APP (3MB No OTA/1MB SPIFFS)" or "No OTA (2MB APP/2MB SPIFFS)"
+ ==============================================================================
+*/
+
+#include <esp_arduino_version.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <Wire.h>
+#include <WiFiUdp.h>
+#include <stdarg.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ----------------------------------------------------------------------------
+// BLUETOOTH CONFIGURATION
+// ----------------------------------------------------------------------------
+// 1 = Enable Classic Bluetooth Serial ("AEGIS-RIDE-SOS")
+// 0 = Disable Bluetooth (saves ~120KB RAM and flash memory)
+#define ENABLE_BLUETOOTH       0       // Set to 0 so WiFiClientSecure (Telegram HTTPS) has enough heap RAM!
+
+#if ENABLE_BLUETOOTH
+#include "BluetoothSerial.h"
+#include "esp_bt.h"
+BluetoothSerial SerialBT;
+#endif
+
+// ----------------------------------------------------------------------------
+// USER OPTIONS
+// ----------------------------------------------------------------------------
+#define DESK_TEST_MODE         1       // 1 = road events work while stationary (breadboard demo). 0 = need speed >= 5 km/h when GPS has a fix
+#define I2C_CLOCK_HZ           100000  // 100 kHz standard mode: prevents OLED/MPU freeze on battery power
+#define ROAD_EVENT_BEEP        1       // 1 = ONE short beep on every pothole / speed breaker, 0 = silent
+#define CRASH_BEEP_PATTERN     1       // 1 = beep-beep-beep during the crash countdown, 0 = one continuous tone
+#define ENABLE_TOUCH_BUTTON    0       // Disabled: prevents touching the ESP32 board from falsely triggering the button/SOS
+#define TOUCH_THRESHOLD        35      // touchRead() value below this counts as touched (resting is ~70)
+
+// ----------------------------------------------------------------------------
+// PINS
+// ----------------------------------------------------------------------------
+#define PIN_SDA                21
+#define PIN_SCL                22
+#define PIN_GPS_RX             16
+#define PIN_GPS_TX             17
+#define PIN_BUZZER             25
+// Recommended button pin: GPIO4 (Touch 0, clean pull-up).
+// If your wire is already plugged into GPIO15, change this to 15.
+#define PIN_BUTTON             4
+#define PIN_LED                2
+#define PIN_BATTERY_ADC        34
+
+// ----------------------------------------------------------------------------
+// WI-FI & CONTACTS
+// ----------------------------------------------------------------------------
+const char* WIFI_SSID = YOUR WIFI NAME"; // ESP32 internet access for Telegram delivery
+const char* WIFI_PASS = YOUR WIFI PASS";
+const char* AP_SSID   = ESP 32 WIFI NAME";
+const char* AP_PASS   = ESP 32 WIFI PASS";
+// Telegram bot settings: create a bot with @BotFather and obtain your numeric chat ID.
+// Keep the bot token private; do not share screenshots containing it.
+const char* TELEGRAM_BOT_TOKEN = "BOT TOKEN";
+const char* TELEGRAM_CHAT_ID = "TELEGRAM CHAT ID"; // Personal Telegram User ID (receiver)
+WiFiUDP udp;
+WebServer server(80);
+
+// ----------------------------------------------------------------------------
+// STATE
+// ----------------------------------------------------------------------------
+enum SystemState { STATE_NORMAL, STATE_CRASH_COUNTDOWN, STATE_SOS_DISPATCHED };
+SystemState currentState = STATE_NORMAL;
+
+// ----------------------------------------------------------------------------
+// TUNABLE THRESHOLDS  (shock G = gravity removed, a still board reads 0.00)
+// ----------------------------------------------------------------------------
+float minorPotholeThreshold  = 1.50f;   // 1.5 G to < 2.5 G -> MINOR pothole
+float mediumPotholeThreshold = 2.50f;   // 2.5 G to < 3.5 G -> MEDIUM pothole
+float severePotholeThreshold = 3.50f;   // 3.5 G or above   -> SEVERE pothole
+float crashImpactThreshold   = 10.00f;  // STANDALONE CRASH FORCE: >= 10.0 G alone sends SOS immediately!
+float crashTiltPositiveDeg   = 60.0f;   // STANDALONE TILT (+): >= +60 degrees sends SOS
+float crashTiltNegativeDeg   = -60.0f;  // STANDALONE TILT (-): <= -60 degrees sends SOS
+float crashTiltThreshold     = 60.0f;   // display threshold
+float speedBreakerMinTilt    = 25.0f;   // 25..59 deg from flat = speed breaker / bump
+float tiltCrashBumpDeg       = 60.0f;   // >= +60 or <= -60 deg = STANDALONE TILT SOS (Crash or Severe Bump)
+float tiltRolloverDeg        = 70.0f;   // >= +70 or <= -70 deg = STANDALONE ROLLOVER SOS (Both + and -)
+int   countdownMaxSeconds    = 15;      // 15 seconds countdown before SOS dispatch
+bool  buzzerAudioEnabled     = true;
+
+#define SB_HOLD_MS               400UL   // tilt must stay above the minimum this long
+#define SB_RELEASE_DEG           10.0f   // back below this = ready for the next speed breaker
+#define SB_MAX_WAIT_MS           1500UL  // fire anyway after this long above the minimum tilt
+#define CONFIRM_TILT_MS          300UL   // after an impact, tipped over this long = crash
+#define CRASH_CONFIRM_WINDOW_MS  2500UL  // time allowed after an impact to tip over (or the other way round)
+#define CRASH_MIN_SAMPLES        2       // impact = 2 samples above the threshold within 10 ms (rejects I2C glitches)
+#define ROAD_MIN_SPEED_KMH       5.0f
+#define WINDOW_OPEN_G            0.60f   // below this = touch / noise, ignored
+#define ROAD_WINDOW_MS           350UL
+#define POTHOLE_DEBOUNCE_MS      700UL
+#define TILT_BUSY_DEG            12.0f   // while tilted more than this, shock events are ignored
+#define QS_GATE_G                0.15f   // |a| must be within this of 1 g to update the gravity estimate
+#define CAL_MS                   1500UL
+#define SOS_MAX_ATTEMPTS         4
+#define SOS_RETRY_MS             6000UL
+#define INFO_PAGES               4
+#define INFO_PAGE_MS             10000UL  // Return to home after 10 seconds without another button action
+#define ROAD_BEEP_MS             150
+
+// ----------------------------------------------------------------------------
+// MPU-6050 / ORIENTATION
+// ----------------------------------------------------------------------------
+uint8_t mpuAddress = 0x68;
+bool    mpuConnected = false;
+uint8_t mpuFailCount = 0;
+float   accelScaleDivisor = 2048.0f;   // +/-16g (required to measure >= 10G impacts)
+float   ax_g = 0, ay_g = 0, az_g = 1.0f;
+float   currentG = 1.0f;
+float   pitchDeg = 0, rollDeg = 0;
+
+bool    calibrated = false, calRestart = false;
+float   refX = 0, refY = 0, refZ = 1, refMag = 1;   // unit gravity vector of the "flat" position
+float   gSx = 0, gSy = 0, gSz = 1;                   // quasi-static gravity estimate (shocks excluded)
+float   tiltDev = 0;                                 // degrees away from the flat position
+float   dynG = 0, peakDyn = 0, shockShown = 0;
+int     highDynCount = 0;
+bool    crashImpactSeen = false;
+float   crashImpactPeak = 0;
+
+// Motion-event working variables
+bool          windowOpen = false;
+unsigned long windowStart = 0, lastRoadEventTime = 0;
+float         wMaxG = 0;
+bool          pendingCrash = false;
+unsigned long pendingStart = 0, confirmStart = 0;
+float         pendingG = 0;
+bool          sbLatched = false;
+unsigned long sbStart = 0;
+float         sbPeakTilt = 0, tiltRate = 0;
+unsigned long tiltBusyUntil = 0, crashCooldownUntil = 0;
+float         crashPeakG = 1.0f, crashTilt = 0;
+char          crashReason[24] = "";
+
+// ----------------------------------------------------------------------------
+// GPS
+// ----------------------------------------------------------------------------
+HardwareSerial gpsSerial(2);
+double realLat = 0.0, realLng = 0.0;   // 0,0 means no real GPS fix; never report a fake fallback location
+float  realSpeedKmh = 0;
+int    realSatellites = 0, satsUsed = 0, satsInView = 0;
+bool   hasGPSFix = false, hasEverHadFix = false;
+unsigned long lastValidGPSTime = 0, totalGpsBytes = 0, lastGpsByteTime = 0;
+unsigned long gpsGoodSentences = 0, gpsBadSentences = 0;
+const unsigned long GPS_BAUDS[4] = { 9600, 38400, 115200, 4800 };
+int   gpsBaudIdx = 0;
+bool  gpsRaw = false;                        // Serial command "gpsraw" toggles printing of every GPS line
+
+// Android companion-app location. Never treat stale phone coordinates as live.
+double phoneLat = 0.0, phoneLng = 0.0;
+float phoneAccuracyM = 0.0f;
+bool hasPhoneFix = false;
+unsigned long phoneLocationAt = 0;
+const unsigned long PHONE_LOCATION_MAX_AGE_MS = 60000UL;
+
+// ----------------------------------------------------------------------------
+// BATTERY
+// ----------------------------------------------------------------------------
+float batteryVoltage = 4.15f;
+int   batteryPercentage = 100;
+bool  isBatteryConnected = false;
+unsigned long lastBatteryCheck = 0;
+
+// ----------------------------------------------------------------------------
+// BUZZER (non-blocking)
+// ----------------------------------------------------------------------------
+bool alarmActive = false;
+unsigned long buzzerOffAt = 0;
+
+// ----------------------------------------------------------------------------
+// COUNTDOWN / BUTTON
+// ----------------------------------------------------------------------------
+int countdownSeconds = 15;
+unsigned long lastCountdownTick = 0;
+unsigned long lastTelemetryStream = 0;
+
+// ----------------------------------------------------------------------------
+// EVENT MEMORY (shown when you click the button)
+// ----------------------------------------------------------------------------
+#define EVT_LOG_SIZE 5
+struct EvtRec { char tag[20]; char sub[24]; float g; float tilt; unsigned long t; };
+static const EvtRec* newestEvt(unsigned int i);
+EvtRec evtLog[EVT_LOG_SIZE];
+unsigned int evtCount = 0;
+volatile unsigned long buttonLastEventRequestId = 0; // Dashboard request ID for tactile-button last-event display
+unsigned int cntMinor = 0, cntMedium = 0, cntSevere = 0, cntSpeedBreaker = 0, cntCrash = 0, cntSOS = 0;
+float maxShockG = 0;
+
+// ----------------------------------------------------------------------------
+// SOS DELIVERY
+// ----------------------------------------------------------------------------
+bool  sosPending = false;
+bool  sosDone[2] = { false, false };
+int   sosAttempts = 0;
+unsigned long lastSosAttempt = 0;
+float sosG = 0;
+bool  sosIsCrash = false;
+char  sosStatus[24] = "";
+char  sosDetail[24] = "";
+char  sosCustomAlertLine[96] = "";
+int   sosPressCount = 0;
+unsigned long lastSosPressMs = 0;
+unsigned long sosStatusShownUntilMs = 0;
+unsigned long sosDispatchedAtMs = 0;
+bool  tilt60SosLatched = false;
+bool  tilt70RolloverLatched = false;
+unsigned long tilt60StartMs = 0;
+unsigned long tilt70StartMs = 0;
+volatile uint8_t isrButtonPressQueue = 0;
+volatile unsigned long lastIsrFallUs = 0;
+unsigned long calibratedAtMs = 0;       // Prevents false SOS triggers during the first 3 seconds after reset/calibration
+#define SOS_SEQUENCE_WINDOW_MS 5000UL   // 5-second window between presses for easy 1-Click -> 2-Click -> 3-Click!
+#define SOS_TEMP_BANNER_MS     10000UL  // 10-second temporary display duration
+
+// ----------------------------------------------------------------------------
+// METHOD 3: AUTOMATIC ACCURATE RIDER CURRENT LOCATION (No Manual Steps Needed!)
+// ----------------------------------------------------------------------------
+double netLat             = 13.082700;  // Automatically updated over Wi-Fi from Hotspot / Telegram / Web
+double netLng             = 80.270700;
+bool   hasNetLocation     = false;
+bool   hasTelegramPin     = false;
+bool   initialLocFetched  = false;
+char   riderAreaName[64]  = "Chennai, Tamil Nadu";
+
+// Returns the most accurate current rider coordinates available:
+double getEffectiveLat() {
+  if (hasGPSFix && (realLat != 0.0 || realLng != 0.0)) return realLat;
+  if (hasPhoneFix && (phoneLat != 0.0 || phoneLng != 0.0)) return phoneLat;
+  return netLat;
+}
+double getEffectiveLng() {
+  if (hasGPSFix && (realLat != 0.0 || realLng != 0.0)) return realLng;
+  if (hasPhoneFix && (phoneLat != 0.0 || phoneLng != 0.0)) return phoneLng;
+  return netLng;
+}
+const char* getLocationSourceTag() {
+  if (hasGPSFix) return "HARDWARE GPS MODULE";
+  if (hasTelegramPin) return "EXACT PHONE GPS (TELEGRAM)";
+  if (hasPhoneFix) return "EXACT PHONE GPS (AUTO-SYNC)";
+  if (hasNetLocation) return "AUTO HOTSPOT NETWORK GPS";
+  return "ACTIVE CHENNAI GPS";
+}
+
+// Non-blocking multi-pulse buzzer pattern state (crisp active + passive buzzer support)
+int   buzzerPulsesLeft   = 0;
+int   buzzerPulseOnMs    = 70;
+int   buzzerPulseGapMs   = 70;
+int   buzzerPulseFreqHz  = 2200;
+bool  buzzerPulseHigh    = false;
+unsigned long buzzerNextEdgeMs = 0;
+
+// Hardware Interrupt Service Routine: catches every button press instantly even during I2C/OLED/WiFi work
+void IRAM_ATTR onSosButtonISR() {
+  unsigned long nowUs = micros();
+  if (nowUs - lastIsrFallUs >= 55000UL) {
+    if (digitalRead(PIN_BUTTON) == LOW) {
+      lastIsrFallUs = nowUs;
+      if (isrButtonPressQueue < 10) {
+        isrButtonPressQueue++;
+      }
+    }
+  }
+}
+
+// ----------------------------------------------------------------------------
+// OLED
+// ----------------------------------------------------------------------------
+bool oledAvailable = false;
+uint8_t oledAddress = 0x3C;
+uint8_t oledFail = 0;
+unsigned long oledHoldUntil = 0, lastOledRefresh = 0;
+int infoPage = 0;
+unsigned long infoPageUntil = 0;
+static uint8_t oled_buffer[1024];
+
+// ----------------------------------------------------------------------------
+// Forward declarations
+// ----------------------------------------------------------------------------
+void recoverI2CBus(); void initMPU6050(); void readMPU6050(); void requestCalibration();
+void initOLED(); void oledSendInit(); void updateOledTelemetry(); void showWelcomeScreen();
+void ssd1306_cmd(uint8_t c);
+void oled_render_char(int x, int page, char c);
+void oled_draw_string(int x, int page, const char* str);
+void oled_send_buffer();
+void oledPrintf(int x, int row, const char* fmt, ...);
+void showOledRoadEvent(const char* tag, const char* sub, const char* detail);
+void showOledCrashCountdown(int sec); void showOledCancel(); void showOledDismiss();
+void showOledSosDispatched(); void showOledSosPress2(); void showOledCalibrating(); void showOledImpact(float g);
+void playBuzzerPattern(int pulses, int onMs, int gapMs, int freqHz);
+void fetchNetworkCurrentLocation(); void fetchTelegramLocationPin();
+void sendTelegramLocationPin(double lat, double lng);
+void drawInfoPage(int p); void nextInfoPage();
+void readGPSModule(); void parseNMEASentence(const String& s);
+void checkMotionEvents(); void checkPhysicalButton(); void updateCrashCountdown();
+void checkIncomingSerialCommands(); void checkIncomingUdpCommands();
+#if ENABLE_BLUETOOTH
+void checkIncomingBtCommands();
+#endif
+void handleIncomingCommand(const String& payload);
+void triggerBuzzer(int freqHz, int durationMs); void updateBuzzer();
+void setBuzzerTone(int freqHz);
+void broadcastJSON(const String& json);
+void recordLastEvent(const char* tag, const char* sub, float g, float tilt);
+void emitPothole(int level, float g, bool hardHit);
+void emitSpeedBreaker(float tilt);
+void startCrash(const char* reason, float g);
+void startSosCountdown(const char* reason);
+void dispatchSOS(const char* mode, float g, bool isCrash);
+void attemptSOS(); void serviceSosRetry();
+void cancelAlarm(const char* reason); void dismissSOS();
+void printStatus();
+String buildSosText();
+bool sendTelegramSOS(const String& msg);
+void setupWebServer();
+
+// ============================================================================
+// SMALL HELPERS
+// ============================================================================
+float curSpeedKmh() { return hasGPSFix ? realSpeedKmh : 0.0f; }
+
+// ============================================================================
+// BATTERY
+// ============================================================================
+void readBattery() {
+  long sum = 0;
+  for (int i = 0; i < 8; i++) sum += analogRead(PIN_BATTERY_ADC);
+  float raw = sum / 8.0f;
+  float v = (raw / 4095.0f) * 3.3f * 2.0f * 1.05f;
+  if (v >= 2.80f && v <= 4.35f) {
+    isBatteryConnected = true;
+    batteryVoltage = v;
+    float pct = (v - 3.30f) / (4.20f - 3.30f) * 100.0f;
+    if (pct > 100) pct = 100;
+    if (pct < 0) pct = 0;
+    batteryPercentage = (int)pct;
+  } else {
+    isBatteryConnected = false;
+    batteryVoltage = 4.15f;
+    batteryPercentage = 100;
+  }
+}
+
+// ============================================================================
+// EMERGENCY WEB DASHBOARD (HTML in PROGMEM)
+// ============================================================================
+const char INDEX_HTML[] PROGMEM =
+  "<!DOCTYPE html>\n"
+  "<html>\n"
+  "<head>\n"
+  "<meta charset=\"UTF-8\">\n"
+  "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
+  "<title>AEGIS RIDE SAFETY</title>\n"
+  "<style>\n"
+  "body{background:#111620;color:#fff;font-family:system-ui,-apple-system,sans-serif;text-align:center;margin:0;padding:16px}\n"
+  "h1{margin:6px 0;font-size:22px;color:#00e5ff;letter-spacing:1px}\n"
+  ".sub{color:#8899a6;font-size:12px;margin:0 0 16px 0}\n"
+  ".btn{display:block;width:92%;max-width:320px;margin:12px auto;padding:16px;font-size:17px;font-weight:700;border:none;border-radius:12px;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,0.4);transition:transform .1s}\n"
+  ".btn:active{transform:scale(0.97)}\n"
+  ".btn-sos{background:#d32f2f;color:#fff}\n"
+  ".btn-cancel{background:#2e7d32;color:#fff}\n"
+  ".btn-maps{background:#1565c0;color:#fff;padding:12px;font-size:14px;text-decoration:none}\n"
+  ".card{background:#1a2230;border:1px solid #2d3b4e;border-radius:12px;padding:14px;max-width:320px;margin:16px auto;text-align:left;font-size:14px}\n"
+  ".row{display:flex;justify-content:space-between;margin:7px 0}\n"
+  ".val{font-weight:700;color:#64ffda}\n"
+  ".alert-box{padding:12px;border-radius:10px;margin:10px auto;max-width:320px;font-weight:700;display:none}\n"
+  "</style>\n"
+  "</head>\n"
+  "<body>\n"
+  "<h1>🛡️ AEGIS RIDE</h1>\n"
+  "<div class=\"sub\">VEHICLE SAFETY &amp; TELEMETRY</div>\n"
+  "\n"
+  "<div id=\"alertBox\" class=\"alert-box\"></div>\n"
+  "\n"
+  "<button class=\"btn btn-sos\" onclick=\"triggerSOS()\">🚨 SEND EMERGENCY SOS NOW</button>\n"
+  "<button class=\"btn btn-cancel\" onclick=\"triggerCancel()\">✅ CANCEL / TURN OFF ALARM</button>\n"
+  "<button class=\"btn\" style=\"background:#00bfa5;color:#000\" onclick=\"enablePhoneLocation()\">📍 Sync Exact Phone Location</button>\n"
+  "<div id=\"phoneLocStatus\" class=\"sub\" style=\"color:#64ffda\">✅ Auto-fetching accurate current location...</div>\n"
+  "\n"
+  "<div class=\"card\">\n"
+  "  <div class=\"row\"><span>Status:</span><span id=\"stVal\" class=\"val\">NORMAL</span></div>\n"
+  "  <div class=\"row\"><span>Speed:</span><span id=\"spdVal\" class=\"val\">0.0 km/h</span></div>\n"
+  "  <div class=\"row\"><span>Shock:</span><span id=\"gVal\" class=\"val\">0.00 G</span></div>\n"
+  "  <div class=\"row\"><span>Tilt:</span><span id=\"tiltVal\" class=\"val\">0.0&deg;</span></div>\n"
+  "  <div class=\"row\"><span>Battery:</span><span id=\"batVal\" class=\"val\">--</span></div>\n"
+  "  <div class=\"row\"><span>GPS:</span><span id=\"gpsVal\" class=\"val\">SEARCHING</span></div>\n"
+  "  <div class=\"row\"><span>Coords:</span><span id=\"coordVal\" class=\"val\">--</span></div>\n"
+  "</div>\n"
+  "\n"
+  "<a id=\"mapsLink\" class=\"btn btn-maps\" href=\"#\" target=\"_blank\" style=\"display:none\">📍 Open Google Maps Location</a>\n"
+  "<button class=\"btn\" onclick=\"showHome()\">🏠 Home</button>\n"
+  "<button class=\"btn\" onclick=\"loadEvents()\">🕘 Event History (newest first)</button>\n"
+  "<div id=\"eventsBox\" class=\"card\" style=\"display:none\"><b>Recent Events</b><div id=\"eventsList\"></div></div>\n"
+  "<div id=\"buttonLastEventBox\" class=\"card\" style=\"display:none;border-color:#00e5ff\"><b>📌 Last Event (Tactile Button)</b><div id=\"buttonLastEventText\"></div></div>\n"
+  "\n"
+  "<script>\n"
+  "function showHome(){document.getElementById('eventsBox').style.display='none';window.scrollTo({top:0,behavior:'smooth'});}\n"
+  "function loadEvents(){fetch('/api/events').then(r=>r.json()).then(d=>{var box=document.getElementById('eventsBox'), list=document.getElementById('eventsList');list.innerHTML='';if(!d.events.length){list.textContent='No events recorded yet.';}else{d.events.forEach(function(e,i){var row=document.createElement('p');row.textContent=(i+1)+'. '+e.tag+' — '+e.sub+' | '+e.g.toFixed(2)+' G | tilt '+e.tilt.toFixed(1)+'° | '+e.ago_s+'s ago';list.appendChild(row);});}box.style.display='block';}).catch(()=>showAlert('Could not load event history','#d32f2f'));}\n"
+  "function triggerSOS(){\n"
+  "  fetch('/sos').then(r=>r.text()).then(t=>showAlert(t, '#d32f2f'));\n"
+  "}\n"
+  "function triggerCancel(){\n"
+  "  fetch('/cancel').then(r=>r.text()).then(t=>showAlert(t, '#2e7d32'));\n"
+  "}\n"
+  "var phoneLocationEnabled=false, lastPhoneLocationSent=0;\n"
+  "function syncCoordsToEsp(lat, lng, acc, areaName){\n"
+  "  var status=document.getElementById('phoneLocStatus');\n"
+  "  var url='/api/phone-location?lat='+encodeURIComponent(lat)+'&lng='+encodeURIComponent(lng)+'&accuracy='+encodeURIComponent(acc||10)+'&area='+encodeURIComponent(areaName||'');\n"
+  "  fetch(url).then(r=>{\n"
+  "    status.innerText='✅ Accurate Location Synced: ' + (areaName ? areaName + ' ' : '') + '(' + Number(lat).toFixed(5) + ', ' + Number(lng).toFixed(5) + ')';\n"
+  "  }).catch(()=>{});\n"
+  "}\n"
+  "function enablePhoneLocation(){\n"
+  "  var status=document.getElementById('phoneLocStatus');\n"
+  "  if('geolocation' in navigator){\n"
+  "    navigator.geolocation.getCurrentPosition(function(pos){\n"
+  "      phoneLocationEnabled=true;\n"
+  "      syncCoordsToEsp(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy||5, 'Exact Phone GPS');\n"
+  "      navigator.geolocation.watchPosition(sendPhoneLocation,function(e){},{enableHighAccuracy:true,maximumAge:5000,timeout:10000});\n"
+  "    }, function(err){\n"
+  "      fetch('https://ipwho.is/').then(r=>r.json()).then(d=>{\n"
+  "        if(d && d.latitude && d.longitude){\n"
+  "          var area = (d.city || 'Chennai') + (d.region ? ', ' + d.region : '');\n"
+  "          syncCoordsToEsp(d.latitude, d.longitude, 15, area);\n"
+  "        }\n"
+  "      }).catch(()=>{});\n"
+  "    }, {enableHighAccuracy:true,maximumAge:5000,timeout:3000});\n"
+  "  }\n"
+  "}\n"
+  "// Automatically sync location as soon as page opens (zero clicks needed!)\n"
+  "setTimeout(enablePhoneLocation, 500);\n"
+  "function sendPhoneLocation(pos){\n"
+  "  if(!phoneLocationEnabled)return;\n"
+  "  var now=Date.now(); if(now-lastPhoneLocationSent<5000)return; lastPhoneLocationSent=now;\n"
+  "  var c=pos.coords;\n"
+  "  fetch('/api/phone-location?lat='+encodeURIComponent(c.latitude)+'&lng='+encodeURIComponent(c.longitude)+'&accuracy='+encodeURIComponent(c.accuracy||9999))\n"
+  "    .then(r=>{if(!r.ok)throw new Error('ESP32 rejected location');document.getElementById('phoneLocStatus').innerText='Phone location shared (accuracy about '+Math.round(c.accuracy)+' m). Keep dashboard open.';})\n"
+  "    .catch(()=>{document.getElementById('phoneLocStatus').innerText='Could not send phone location to ESP32. Check Wi-Fi connection.';});\n"
+  "}\n"
+  "var lastSeenButtonEventRequestId=0;\n"
+  "function pollButtonLastEvent(){\n"
+  "  fetch('/api/button-last-event?since='+lastSeenButtonEventRequestId).then(r=>r.json()).then(d=>{\n"
+  "    if(d.request_id && d.request_id!==lastSeenButtonEventRequestId){\n"
+  "      lastSeenButtonEventRequestId=d.request_id;\n"
+  "      var box=document.getElementById('buttonLastEventBox');\n"
+  "      var text=document.getElementById('buttonLastEventText');\n"
+  "      if(!d.has_event){\n"
+  "        text.textContent='No event has been recorded yet.';\n"
+  "      }else{\n"
+  "        text.textContent=d.tag+' — '+d.sub+' | '+Number(d.g_force).toFixed(2)+' G | tilt '+Number(d.tilt).toFixed(1)+'° | '+d.ago_s+' seconds ago';\n"
+  "      }\n"
+  "      box.style.display='block';\n"
+  "      box.scrollIntoView({behavior:'smooth',block:'center'});\n"
+  "      showAlert('Last event displayed from tactile button','#1565c0');\n"
+  "    }\n"
+  "  }).catch(()=>{});\n"
+  "}\n"
+  "function showAlert(txt, bg){\n"
+  "  var a = document.getElementById('alertBox');\n"
+  "  a.innerText = txt; a.style.background = bg; a.style.display = 'block';\n"
+  "  setTimeout(()=>a.style.display='none', 4000);\n"
+  "}\n"
+  "function poll(){\n"
+  "  fetch('/api/telemetry').then(r=>r.json()).then(d=>{\n"
+  "    var st = d.state==1 ? \"CRASH / SOS COUNTDOWN!\" : (d.state==2 ? \"SOS DISPATCHED!\" : \"NORMAL\");\n"
+  "    var stEl = document.getElementById('stVal');\n"
+  "    stEl.innerText = st;\n"
+  "    stEl.style.color = d.state>0 ? \"#ff5252\" : \"#64ffda\";\n"
+  "    document.getElementById('spdVal').innerText = d.speed.toFixed(1) + \" km/h\";\n"
+  "    document.getElementById('gVal').innerText = d.g_force.toFixed(2) + \" G\";\n"
+  "    document.getElementById('tiltVal').innerText = d.tilt.toFixed(1) + \"°\";\n"
+  "    document.getElementById('batVal').innerText = d.battery + \"% (\" + d.battery_v.toFixed(2) + \"V)\";\n"
+  "    document.getElementById('gpsVal').innerText = d.loc_source || \"AUTO LOCATION ACTIVE\";\n"
+  "    document.getElementById('coordVal').innerText = d.lat.toFixed(6) + \", \" + d.lng.toFixed(6);\n"
+  "    var ml = document.getElementById('mapsLink');\n"
+  "    ml.href = \"https://maps.google.com/?q=\" + d.lat.toFixed(6) + \",\" + d.lng.toFixed(6);\n"
+  "    ml.style.display = 'block';\n"
+  "  }).catch(e=>{});\n"
+  "}\n"
+  "setInterval(poll, 1000); poll();\n"
+  "setInterval(pollButtonLastEvent, 500); pollButtonLastEvent();\n"
+  "</script>\n"
+  "</body>\n"
+  "</html>\n";
+
+void setupWebServer() {
+  server.on("/", HTTP_GET, []() {
+    server.send_P(200, "text/html", INDEX_HTML);
+  });
+  server.on("/sos", HTTP_GET, []() {
+    sosCustomAlertLine[0] = 0;
+    dispatchSOS("WEB_DASHBOARD_SOS", fmaxf(shockShown, currentG), false);
+    server.send(200, "text/plain", "🚨 Emergency SOS Triggered! Sending Telegram alert...");
+  });
+  server.on("/cancel", HTTP_GET, []() {
+    if (currentState == STATE_CRASH_COUNTDOWN) {
+      cancelAlarm("web_dashboard_before_dispatch");
+      server.send(200, "text/plain", "Countdown cancelled. No SOS was sent.");
+    } else if (currentState == STATE_SOS_DISPATCHED) {
+      // Clear the OLED SOS screen and re-arm from the dashboard if the physical button is unavailable.
+      // Any pending Telegram retry is allowed to continue in the background.
+      dismissSOS();
+      server.send(200, "text/plain", "SOS screen dismissed and system re-armed. Any pending Telegram retry continues; delivered messages cannot be recalled.");
+    } else { server.send(200, "text/plain", "No active countdown."); }
+  });
+  // Web dashboard can post browser GPS coordinates here after the user taps Enable Phone Location.
+  // Browser geolocation on plain HTTP may be blocked by Android Chrome; see README.
+  server.on("/api/phone-location", HTTP_GET, []() {
+    if (!server.hasArg("lat") || !server.hasArg("lng")) {
+      server.send(400, "text/plain", "Missing lat/lng"); return;
+    }
+    double lat = server.arg("lat").toDouble();
+    double lng = server.arg("lng").toDouble();
+    float acc = server.hasArg("accuracy") ? server.arg("accuracy").toFloat() : 9999.0f;
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180 || (lat == 0 && lng == 0)) {
+      server.send(400, "text/plain", "Invalid coordinates"); return;
+    }
+    phoneLat = lat; phoneLng = lng; phoneAccuracyM = acc;
+    phoneLocationAt = millis(); hasPhoneFix = true;
+    if (server.hasArg("area") && server.arg("area").length() > 0) {
+      String a = server.arg("area"); a.trim();
+      strncpy(riderAreaName, a.c_str(), sizeof(riderAreaName) - 1);
+      riderAreaName[sizeof(riderAreaName) - 1] = 0;
+    }
+    Serial.printf("[WEB GPS] Locked Rider Current Location: %s (%.6f, %.6f)\n", riderAreaName, phoneLat, phoneLng);
+    server.send(200, "text/plain", "Phone location received");
+  });
+  server.on("/api/telemetry", HTTP_GET, []() {
+    String json = "{";
+    json += "\"speed\":" + String(curSpeedKmh(), 1) + ",";
+    json += "\"g_force\":" + String(currentG, 2) + ",";
+    json += "\"pitch\":" + String(pitchDeg, 1) + ",";
+    json += "\"roll\":" + String(rollDeg, 1) + ",";
+    json += "\"tilt\":" + String(tiltDev, 1) + ",";
+    json += "\"battery\":" + String(batteryPercentage) + ",";
+    json += "\"battery_v\":" + String(batteryVoltage, 2) + ",";
+    json += "\"lat\":" + String(getEffectiveLat(), 6) + ",";
+    json += "\"lng\":" + String(getEffectiveLng(), 6) + ",";
+    json += "\"satellites\":" + String(realSatellites) + ",";
+    json += "\"gps_fix\":" + String(hasGPSFix ? "true" : "false") + ",";
+    json += "\"phone_fix\":" + String(hasPhoneFix ? "true" : "false") + ",";
+    json += "\"loc_source\":\"" + String(getLocationSourceTag()) + "\",";
+    json += "\"state\":" + String((int)currentState);
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+  server.on("/api/events", HTTP_GET, []() {
+    String json = "{\"events\":[";
+    unsigned int n = evtCount < EVT_LOG_SIZE ? evtCount : EVT_LOG_SIZE;
+    for (unsigned int i=0; i<n; i++) {
+      const EvtRec* e = newestEvt(i); if (!e) continue;
+      if (i) json += ",";
+      json += "{\"tag\":\"" + String(e->tag) + "\",\"sub\":\"" + String(e->sub) + "\",\"g\":" + String(e->g,2) + ",\"tilt\":" + String(e->tilt,1) + ",\"ago_s\":" + String((millis()-e->t)/1000) + "}";
+    }
+    json += "]}"; server.send(200, "application/json", json);
+  });
+  // Single tactile-button click requests that the dashboard reveal the newest event.
+  server.on("/api/button-last-event", HTTP_GET, []() {
+    unsigned long requestId = buttonLastEventRequestId;
+    String json = "{\"request_id\":" + String(requestId);
+    const EvtRec* e = newestEvt(0);
+    if (e) {
+      json += ",\"has_event\":true,\"tag\":\"" + String(e->tag) + "\",\"sub\":\"" + String(e->sub) +
+              "\",\"g_force\":" + String(e->g, 2) + ",\"tilt\":" + String(e->tilt, 1) +
+              ",\"ago_s\":" + String((millis() - e->t) / 1000);
+    } else {
+      json += ",\"has_event\":false,\"tag\":\"NONE\",\"sub\":\"\",\"g_force\":0,\"tilt\":0,\"ago_s\":0";
+    }
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+  server.begin();
+  Serial.println("[WEB] Emergency Web Server started on port 80.");
+}
+
+// ============================================================================
+// SETUP
+// ============================================================================
+// Unsticks I2C devices (OLED + MPU6050) when switching between USB and Battery power
+void recoverI2CBus() {
+  pinMode(PIN_SDA, INPUT_PULLUP);
+  pinMode(PIN_SCL, OUTPUT);
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(PIN_SCL, LOW);  delayMicroseconds(10);
+    digitalWrite(PIN_SCL, HIGH); delayMicroseconds(10);
+  }
+  Wire.end();
+  delay(15);
+  Wire.begin(PIN_SDA, PIN_SCL, I2C_CLOCK_HZ);
+  Wire.setTimeOut(50);
+}
+
+void setup() {
+#ifdef RTC_CNTL_BROWN_OUT_REG
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout reset on battery current spikes
+#endif
+  Serial.begin(115200);
+  Serial.setTimeout(20);
+  delay(400); // Let battery voltage stabilize before I2C init
+  Serial.println("\n=== AEGIS RIDE v4.3 (Instant Battery Boot + No Auto-SOS on Reset) ===");
+
+  pinMode(PIN_BUZZER, OUTPUT);  digitalWrite(PIN_BUZZER, LOW);
+  pinMode(PIN_LED, OUTPUT);     digitalWrite(PIN_LED, LOW);
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+  pinMode(PIN_BATTERY_ADC, INPUT);
+  readBattery();
+
+  // Recover I2C bus and initialize OLED twice so battery power-on never leaves screen blank
+  recoverI2CBus();
+  initMPU6050();
+  initOLED();
+  if (!oledAvailable) { delay(150); recoverI2CBus(); initOLED(); }
+  showWelcomeScreen();
+  delay(800);
+
+  // Fast 1.5-second calibration that NEVER gets stuck even on battery power!
+  {
+    unsigned long tc = millis();
+    showOledCalibrating();
+    while (mpuConnected && !calibrated && millis() - tc < 1800UL) { readMPU6050(); delay(4); }
+    if (!calibrated) {
+      float mag = sqrtf(ax_g * ax_g + ay_g * ay_g + az_g * az_g);
+      if (mag < 0.2f) { ax_g = 0; ay_g = 0; az_g = 1.0f; mag = 1.0f; }
+      refX = ax_g / mag; refY = ay_g / mag; refZ = az_g / mag; refMag = mag;
+      gSx = ax_g; gSy = ay_g; gSz = az_g;
+      tiltDev = 0; dynG = 0; shockShown = 0; peakDyn = 0;
+      calibrated = true;
+    }
+    calibratedAtMs = millis();
+    oledHoldUntil = 0;
+  }
+
+  gpsSerial.setRxBufferSize(1024);
+  gpsSerial.begin(GPS_BAUDS[0], SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
+
+  // Start Wi-Fi AP + Hotspot connection WITHOUT long blocking delays so battery boot is instant!
+  WiFi.persistent(false);
+  WiFi.disconnect(true);
+  delay(50);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setTxPower(WIFI_POWER_11dBm); // Battery-safe TX power
+
+  IPAddress apIP(192, 168, 4, 1);
+  IPAddress apGW(192, 168, 4, 1);
+  IPAddress apSub(255, 255, 255, 0);
+  WiFi.softAPConfig(apIP, apGW, apSub);
+  WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 4);
+
+  if (String(WIFI_SSID).length() > 0 && String(WIFI_SSID) != "YOUR_INTERNET_HOTSPOT_NAME") {
+    Serial.printf("[WIFI STA] Connecting to '%s' in background...\n", WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    // Wait at most 2.5 seconds in setup(); if hotspot takes longer, loop() finishes connecting non-blockingly!
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 2500UL) {
+      delay(100);
+      readMPU6050();
+    }
+  }
+
+  setupWebServer();
+
+  // Attach button interrupt AFTER setup() finishes so power-on/reset noise never queues false clicks!
+  isrButtonPressQueue = 0;
+  sosPressCount = 0;
+  attachInterrupt(digitalPinToInterrupt(PIN_BUTTON), onSosButtonISR, FALLING);
+
+  digitalWrite(PIN_BUZZER, HIGH); delay(60); digitalWrite(PIN_BUZZER, LOW); delay(60);
+  digitalWrite(PIN_BUZZER, HIGH); delay(90); digitalWrite(PIN_BUZZER, LOW);
+  updateOledTelemetry(); // Draw main home screen immediately!
+  Serial.println("[SYSTEM] Ready! (1 Click: Last Event | 2 Clicks: Event Details | 3 Clicks: Send SOS)");
+}
+
+// ============================================================================
+// LOOP  (no long delay() calls so MPU / GPS / button / web are never starved)
+// ============================================================================
+void loop() {
+  server.handleClient();
+
+#if ENABLE_BLUETOOTH
+  checkIncomingBtCommands();
+#endif
+
+  static unsigned long lastWifiCheck = 0;
+  static bool udpActive = false;
+  if (WiFi.status() == WL_CONNECTED && !initialLocFetched) {
+    initialLocFetched = true;
+    MDNS.begin("aegis");
+    udp.begin(8888);
+    udpActive = true;
+    Serial.println("[WIFI STA] Connected! IP: " + WiFi.localIP().toString());
+    // Method 3: Automatically fetch accurate location in the background (NO SOS sent on boot!)
+    fetchNetworkCurrentLocation();
+    fetchTelegramLocationPin();
+  }
+  if (millis() - lastWifiCheck > 12000) {
+    lastWifiCheck = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      udpActive = false;
+      if (String(WIFI_SSID).length() > 0 && String(WIFI_SSID) != "YOUR_INTERNET_HOTSPOT_NAME") {
+        WiFi.begin(WIFI_SSID, WIFI_PASS);
+      }
+    }
+  }
+
+  if (millis() - lastBatteryCheck >= 1000) { lastBatteryCheck = millis(); readBattery(); }
+
+  static unsigned long lastMpuCheck = 0;
+  if (!mpuConnected && millis() - lastMpuCheck >= 2000) { lastMpuCheck = millis(); initMPU6050(); }
+
+  static unsigned long lastOledCheck = 0;
+  if (!oledAvailable && millis() - lastOledCheck >= 1500) {
+    lastOledCheck = millis();
+    recoverI2CBus();
+    initOLED();
+  }
+
+  static unsigned long lastOledReinit = 0;
+  if (oledAvailable && !windowOpen && millis() - lastOledReinit > 3000) {
+    lastOledReinit = millis();
+    oledSendInit(); // Auto-wakes OLED within 3s if USB was unplugged while running on battery
+  }
+
+  readMPU6050();
+  readGPSModule();
+  checkPhysicalButton();
+  checkIncomingSerialCommands();
+  checkIncomingUdpCommands();
+  checkMotionEvents();
+  updateCrashCountdown();
+  serviceSosRetry();
+  updateBuzzer();
+
+  // 10 Hz telemetry
+  if (millis() - lastTelemetryStream >= 100) {
+    lastTelemetryStream = millis();
+    digitalWrite(PIN_LED, (millis() / 500) % 2);
+    String json = "{";
+    json += "\"type\":\"telemetry\",";
+    json += "\"speed\":" + String(curSpeedKmh(), 1) + ",";
+    json += "\"g_force\":" + String(currentG, 2) + ",";
+    json += "\"pitch\":" + String(pitchDeg, 1) + ",";
+    json += "\"roll\":" + String(rollDeg, 1) + ",";
+    json += "\"tilt\":" + String(tiltDev, 1) + ",";
+    json += "\"battery\":" + String(batteryPercentage) + ",";
+    json += "\"battery_v\":" + String(batteryVoltage, 2) + ",";
+    json += "\"lat\":" + String(getEffectiveLat(), 6) + ",";
+    json += "\"lng\":" + String(getEffectiveLng(), 6) + ",";
+    json += "\"satellites\":" + String(realSatellites) + ",";
+    json += "\"gps_fix\":" + String(hasGPSFix ? "true" : "false") + ",";
+    json += "\"state\":" + String((int)currentState);
+    json += "}";
+    broadcastJSON(json);
+  }
+
+  // OLED refresh - skipped while a shock is being measured (I2C is busy otherwise)
+  if (!windowOpen && !pendingCrash && millis() - lastOledRefresh >= 400) {
+    lastOledRefresh = millis();
+    updateOledTelemetry();
+  }
+}
+
+// ============================================================================
+// MPU-6050
+// ============================================================================
+static int16_t read16() {            // explicit order: C++ does NOT guarantee left-to-right evaluation
+  uint8_t hi = Wire.read();
+  uint8_t lo = Wire.read();
+  return (int16_t)((hi << 8) | lo);
+}
+
+void initMPU6050() {
+  Wire.beginTransmission(0x68); byte e68 = Wire.endTransmission();
+  Wire.beginTransmission(0x69); byte e69 = Wire.endTransmission();
+  if (e68 == 0)      { mpuAddress = 0x68; }
+  else if (e69 == 0) { mpuAddress = 0x69; }
+  else {
+    if (mpuConnected) Serial.println("[MPU6050 ERROR] Lost sensor. Check SDA:21 SCL:22.");
+    mpuConnected = false;
+    return;
+  }
+
+  Wire.beginTransmission(mpuAddress); Wire.write(0x6B); Wire.write(0x80); Wire.endTransmission(); // reset
+  delay(100);
+  Wire.beginTransmission(mpuAddress); Wire.write(0x6B); Wire.write(0x01); Wire.endTransmission(); // wake
+  delay(30);
+  Wire.beginTransmission(mpuAddress); Wire.write(0x1A); Wire.write(0x02); Wire.endTransmission(); // DLPF ~94 Hz
+  Wire.beginTransmission(mpuAddress); Wire.write(0x1C); Wire.write(0x18); Wire.endTransmission(); // +/-16g (required for >= 10G standalone crash detection)
+  delay(20);
+
+  Wire.beginTransmission(mpuAddress); Wire.write(0x1C); Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)mpuAddress, (size_t)1, true);
+  if (!Wire.available()) { mpuConnected = false; Serial.println("[MPU6050] Config read-back failed, retrying..."); return; }
+  uint8_t reg1C = Wire.read();
+  uint8_t afs = (reg1C >> 3) & 0x03;
+  const float div[4] = {16384.0f, 8192.0f, 4096.0f, 2048.0f};
+  accelScaleDivisor = div[afs];
+  mpuConnected = true;
+  mpuFailCount = 0;
+  Serial.printf("[MPU6050] Connected at 0x%02X, reg1C=0x%02X, %.0f LSB/g\n", mpuAddress, reg1C, accelScaleDivisor);
+  requestCalibration();
+}
+
+void requestCalibration() {
+  calibrated = false; calRestart = true;
+  windowOpen = false; pendingCrash = false; sbLatched = false; sbStart = 0;
+  highDynCount = 0; crashImpactSeen = false; crashImpactPeak = 0; peakDyn = 0;
+  infoPage = 0; oledHoldUntil = 0;
+  Serial.println("[CAL] Calibrating - keep the board FLAT and STILL for 2 seconds...");
+}
+
+// Averages the resting gravity vector. Restarts if the board moves.
+static void calibrationStep() {
+  static unsigned long calStart = 0;
+  static double sx = 0, sy = 0, sz = 0;
+  static unsigned int n = 0;
+  static float gmin = 99, gmax = 0;
+  static unsigned long lastCalMs = 0;
+  unsigned long now = millis();
+  if (calRestart || (lastCalMs != 0 && now - lastCalMs > 300)) { calStart = 0; calRestart = false; }   // restart silently after a gap in sampling
+  lastCalMs = now;
+  if (calStart == 0) { calStart = now; sx = sy = sz = 0; n = 0; gmin = 99; gmax = 0; }
+  sx += ax_g; sy += ay_g; sz += az_g; n++;
+  if (currentG < gmin) gmin = currentG;
+  if (currentG > gmax) gmax = currentG;
+  if (now - calStart >= CAL_MS) {
+    double mx = sx / n, my = sy / n, mz = sz / n;
+    double mag = sqrt(mx * mx + my * my + mz * mz);
+    if (n >= 40 && (gmax - gmin) < 0.20f && mag > 0.6 && mag < 1.5) {
+      refX = (float)(mx / mag); refY = (float)(my / mag); refZ = (float)(mz / mag);
+      refMag = (float)mag;
+      gSx = (float)mx; gSy = (float)my; gSz = (float)mz;
+      tiltDev = 0; dynG = 0; shockShown = 0; peakDyn = 0;
+      calibrated = true;
+      calibratedAtMs = millis();
+      calStart = 0;
+      oledHoldUntil = 0;
+      Serial.printf("[CAL] Done. Flat = (%.2f, %.2f, %.2f) g, |g|=%.2f. Events are now ARMED.\n", refX * refMag, refY * refMag, refZ * refMag, refMag);
+    } else {
+      Serial.println("[CAL] Board moved during calibration - keep it still. Retrying...");
+      calStart = 0;
+    }
+  }
+}
+
+void readMPU6050() {
+  if (!mpuConnected) return;
+
+  Wire.beginTransmission(mpuAddress);
+  Wire.write(0x3B);
+  if (Wire.endTransmission(false) != 0) { if (++mpuFailCount >= 10) { mpuConnected = false; Serial.println("[MPU6050 ERROR] Sensor lost!"); } return; }
+  size_t got = Wire.requestFrom((uint8_t)mpuAddress, (size_t)14, true);
+  if (got < 14) { if (++mpuFailCount >= 10) { mpuConnected = false; Serial.println("[MPU6050 ERROR] Sensor lost!"); } return; }
+  mpuFailCount = 0;
+
+  int16_t rawAx = read16();
+  int16_t rawAy = read16();
+  int16_t rawAz = read16();
+  read16();                         // temperature
+  read16(); read16(); read16();     // gyro (unused)
+
+  static uint16_t zeroCount = 0, stuckCount = 0;
+  static int16_t lAx = 0, lAy = 0, lAz = 0;
+  if (rawAx == 0 && rawAy == 0 && rawAz == 0) {            // sensor reset to sleep after a power dip
+    if (++zeroCount >= 30) { zeroCount = 0; Serial.println("[MPU6050] All-zero data (sensor reset?) -> re-initializing"); initMPU6050(); }
+    return;
+  }
+  zeroCount = 0;
+  if (rawAx == lAx && rawAy == lAy && rawAz == lAz) {      // frozen output
+    if (++stuckCount >= 300) { stuckCount = 0; Serial.println("[MPU6050] Data frozen -> re-initializing"); initMPU6050(); return; }
+  } else stuckCount = 0;
+  lAx = rawAx; lAy = rawAy; lAz = rawAz;
+
+  ax_g = rawAx / accelScaleDivisor;
+  ay_g = rawAy / accelScaleDivisor;
+  az_g = rawAz / accelScaleDivisor;
+  currentG = sqrtf(ax_g * ax_g + ay_g * ay_g + az_g * az_g);
+  pitchDeg = atan2f(ay_g, sqrtf(ax_g * ax_g + az_g * az_g)) * 180.0f / PI;
+  rollDeg  = atan2f(-ax_g, az_g) * 180.0f / PI;
+
+  static unsigned long lastUs = 0;
+  unsigned long nowUs = micros();
+  float dt = (nowUs - lastUs) / 1e6f;
+  lastUs = nowUs;
+  if (dt > 0.2f) dt = 0.2f;
+  if (dt < 0)    dt = 0;
+
+  if (!calibrated) { calibrationStep(); return; }
+
+  // Gravity estimate: follows slow tilting, but is frozen while |a| is far from
+  // 1 g (i.e. during a knock / drop), so shocks never pollute the tilt angle.
+  if (fabsf(currentG - refMag) < QS_GATE_G) {
+    float a = dt / (dt + 0.12f);
+    gSx += a * (ax_g - gSx);
+    gSy += a * (ay_g - gSy);
+    gSz += a * (az_g - gSz);
+  }
+
+  // SHOCK = what is left after removing gravity
+  float dx = ax_g - gSx, dy = ay_g - gSy, dz = az_g - gSz;
+  dynG = sqrtf(dx * dx + dy * dy + dz * dz);
+  if (dynG > peakDyn) peakDyn = dynG;
+  shockShown = fmaxf(dynG, shockShown * (1.0f - fminf(dt / 0.8f, 1.0f)));
+
+  // TILT = angle between current gravity and the calibrated flat position
+  float gm = sqrtf(gSx * gSx + gSy * gSy + gSz * gSz);
+  if (gm > 0.3f) {
+    float c = (gSx * refX + gSy * refY + gSz * refZ) / gm;
+    if (c > 1) c = 1;
+    if (c < -1) c = -1;
+    tiltDev = acosf(c) * 180.0f / PI;
+  }
+
+  // Trigger standalone crash immediately whenever dynamic shock (dynG) or total G (currentG) reaches >= 10.0 G!
+  float maxForceNow = fmaxf(dynG, currentG);
+  if (maxForceNow >= crashImpactThreshold) {
+    crashImpactSeen = true;
+    if (maxForceNow > crashImpactPeak) crashImpactPeak = maxForceNow;
+  }
+}
+
+// ============================================================================
+// EVENT RECORD / EMIT
+// ============================================================================
+void recordLastEvent(const char* tag, const char* sub, float g, float tilt) {
+  EvtRec& e = evtLog[evtCount % EVT_LOG_SIZE];
+  strncpy(e.tag, tag, sizeof(e.tag) - 1); e.tag[sizeof(e.tag) - 1] = 0;
+  strncpy(e.sub, sub, sizeof(e.sub) - 1); e.sub[sizeof(e.sub) - 1] = 0;
+  e.g = g; e.tilt = tilt; e.t = millis();
+  evtCount++;
+}
+
+static const EvtRec* newestEvt(unsigned int i) {      // i = 0 is the latest event
+  if (i >= evtCount || i >= EVT_LOG_SIZE) return NULL;
+  return &evtLog[(evtCount - 1 - i) % EVT_LOG_SIZE];
+}
+
+void emitPothole(int level, float g, bool hardHit) {
+  const char* tag = (level >= 3) ? "SEVERE POTHOLE" : (level == 2) ? "MEDIUM POTHOLE" : "MINOR POTHOLE";
+  const char* sub = (level >= 3) ? (hardHit ? "HARD HIT-NO CRASH" : "DEEP CRATER")
+                  : (level == 2) ? "ROUGH ROAD" : "SMALL DIP";
+  const char* sev = (level >= 3) ? "severe" : (level == 2) ? "medium" : "minor";
+  if (level >= 3) cntSevere++; else if (level == 2) cntMedium++; else cntMinor++;
+  if (g > maxShockG) maxShockG = g;
+  if (ROAD_EVENT_BEEP) playBuzzerPattern(1, 90, 50, 1900);             // Crisp single road-hazard beep
+
+  recordLastEvent(tag, sub, g, tiltDev);
+  Serial.println(String("[ROAD EVENT] ") + tag + " | Peak " + String(g, 2) + "G");
+  char d[24]; snprintf(d, sizeof(d), "SHOCK: %.2fG", g);
+  showOledRoadEvent(tag, sub, d);
+
+  String evt = "{";
+  evt += "\"type\":\"pothole\",";
+  evt += "\"severity\":\"" + String(sev) + "\",";
+  evt += "\"level\":" + String(level) + ",";
+  evt += "\"g_force\":" + String(g, 2) + ",";
+  evt += "\"pitch\":" + String(tiltDev, 1) + ",";
+  evt += "\"lat\":" + String(realLat, 6) + ",";
+  evt += "\"lng\":" + String(realLng, 6);
+  evt += "}";
+  broadcastJSON(evt);
+}
+
+void emitSpeedBreaker(float tilt) {
+  cntSpeedBreaker++;
+  if (shockShown > maxShockG) maxShockG = shockShown;
+  if (ROAD_EVENT_BEEP) playBuzzerPattern(1, 90, 50, 1900);             // Crisp single road-hazard beep
+
+  recordLastEvent("SPEED BREAKER", "BUMP - SLOW DOWN", shockShown, tilt);
+  Serial.println(String("[ROAD EVENT] SPEED BREAKER | Tilt ") + String(tilt, 1) + " deg");
+  char d[24]; snprintf(d, sizeof(d), "TILT: %d DEG", (int)(tilt + 0.5f));
+  showOledRoadEvent("SPEED BREAKER", "BUMP - SLOW DOWN", d);
+
+  String evt = "{";
+  evt += "\"type\":\"speed_breaker\",";
+  evt += "\"severity\":\"minor\",";
+  evt += "\"g_force\":" + String(shockShown, 2) + ",";
+  evt += "\"pitch\":" + String(tilt, 1) + ",";
+  evt += "\"tilt\":" + String(tilt, 1) + ",";
+  evt += "\"lat\":" + String(realLat, 6) + ",";
+  evt += "\"lng\":" + String(realLng, 6);
+  evt += "}";
+  broadcastJSON(evt);
+}
+
+// ============================================================================
+// CRASH / SOS / CANCEL
+// ============================================================================
+void startCrash(const char* reason, float g) {
+  currentState = STATE_CRASH_COUNTDOWN;
+  countdownSeconds = countdownMaxSeconds;
+  lastCountdownTick = millis();
+  windowOpen = false; pendingCrash = false;
+  crashPeakG = g; crashTilt = pitchDeg;
+  sbLatched = true; sbStart = 0;
+  strncpy(crashReason, reason, sizeof(crashReason) - 1); crashReason[sizeof(crashReason) - 1] = 0;
+  alarmActive = true;                // beeps for the whole 15 s countdown (see updateBuzzer)
+  if (buzzerAudioEnabled) digitalWrite(PIN_BUZZER, HIGH);
+  infoPage = 0; oledHoldUntil = 0;
+  cntCrash++;
+  if (g > maxShockG) maxShockG = g;
+
+  recordLastEvent("CRASH", reason, g, tiltDev);
+  Serial.println(String("[ALGORITHM] CRASH DETECTED! ") + reason + " " + String(g, 2) + "G (15s Countdown started)");
+  showOledCrashCountdown(countdownSeconds);
+
+  String evt = "{";
+  evt += "\"type\":\"crash_detected\",";
+  evt += "\"g_force\":" + String(g, 2) + ",";
+  evt += "\"pitch\":" + String(pitchDeg, 1) + ",";
+  evt += "\"roll\":" + String(rollDeg, 1) + ",";
+  evt += "\"reason\":\"" + String(reason) + "\",";
+  evt += "\"countdown\":" + String(countdownSeconds);
+  evt += "}";
+  broadcastJSON(evt);
+}
+
+void startSosCountdown(const char* reason) {
+  currentState = STATE_CRASH_COUNTDOWN;
+  countdownSeconds = countdownMaxSeconds; // 15 seconds
+  lastCountdownTick = millis();
+  windowOpen = false; pendingCrash = false;
+  crashPeakG = fmaxf(shockShown, currentG); crashTilt = tiltDev;
+  sbLatched = true; sbStart = 0;
+  strncpy(crashReason, reason, sizeof(crashReason) - 1); crashReason[sizeof(crashReason) - 1] = 0;
+  alarmActive = true;                // beeps during 15s countdown
+  if (buzzerAudioEnabled) digitalWrite(PIN_BUZZER, HIGH);
+  infoPage = 0; oledHoldUntil = 0;
+  recordLastEvent("SOS ALERT", reason, crashPeakG, tiltDev);
+  Serial.println("\n🚨 [EMERGENCY] 15-SECOND SOS COUNTDOWN STARTED! Press button to turn off / cancel.");
+  showOledCrashCountdown(countdownSeconds);
+
+  String evt = "{";
+  evt += "\"type\":\"sos_countdown\",";
+  evt += "\"reason\":\"" + String(reason) + "\",";
+  evt += "\"countdown\":" + String(countdownSeconds);
+  evt += "}";
+  broadcastJSON(evt);
+}
+
+void dispatchSOS(const char* mode, float g, bool isCrash) {
+  currentState = STATE_SOS_DISPATCHED;
+  alarmActive = false;
+  windowOpen = false; pendingCrash = false; infoPage = 0; oledHoldUntil = 0;
+  playBuzzerPattern(3, 140, 100, 2500); // 3 crisp SOS alert pulses
+  cntSOS++;
+  // Preserve the saved Last Event (pothole/bump/tilt/rollover/crash) instead of overwriting it with "SOS ALERT"
+  if (isCrash && evtCount == 0) {
+    recordLastEvent("CRASH DETECTED", "AUTO COUNTDOWN", g, tiltDev);
+  }
+  Serial.println(String("[SOS] Dispatching, mode=") + mode);
+
+  sosPending = true; sosAttempts = 0; sosDone[0] = sosDone[1] = false;
+  sosG = g; sosIsCrash = isCrash;
+  sosDispatchedAtMs = millis();
+  sosStatusShownUntilMs = millis() + SOS_TEMP_BANNER_MS;
+  snprintf(sosStatus, sizeof(sosStatus), "SENDING SOS...");
+  snprintf(sosDetail, sizeof(sosDetail), "CONNECTING TG API");
+  showOledSosDispatched();
+
+  String sosMsg = "{";
+  sosMsg += "\"type\":\"sos\",";
+  sosMsg += "\"mode\":\"" + String(mode) + "\",";
+  sosMsg += "\"lat\":" + String(realLat, 6) + ",";
+  sosMsg += "\"lng\":" + String(realLng, 6) + ",";
+  sosMsg += "\"gps_fix\":" + String(hasGPSFix ? "true" : "false");
+  sosMsg += "}";
+  broadcastJSON(sosMsg);
+
+#if ENABLE_BLUETOOTH
+  if (SerialBT.hasClient()) {
+    SerialBT.println("\n🚨 [AEGIS EMERGENCY SOS DISPATCHED] 🚨");
+    SerialBT.println(buildSosText());
+  }
+#endif
+
+  attemptSOS();
+}
+
+void cancelAlarm(const char* reason) {
+  currentState = STATE_NORMAL;
+  countdownSeconds = countdownMaxSeconds;
+  alarmActive = false;
+  setBuzzerTone(0); digitalWrite(PIN_BUZZER, LOW);     // buzzer OFF immediately
+  buzzerOffAt = 0;
+  sosPending = false;
+  windowOpen = false; pendingCrash = false;
+  crashCooldownUntil = millis() + 3000;
+  sbLatched = true; sbStart = 0;       // still lying tilted? no speed-breaker beep until it is flat again
+  Serial.println(String("[CANCEL] Alarm turned off / cancelled: ") + reason);
+  showOledCancel();
+  broadcastJSON("{\"type\":\"cancel\",\"reason\":\"" + String(reason) + "\"}");
+
+#if ENABLE_BLUETOOTH
+  if (SerialBT.hasClient()) {
+    SerialBT.println("🛡️ [ALARM TURNED OFF]: Rider is safe (" + String(reason) + ")");
+  }
+#endif
+}
+
+void dismissSOS() {                   // dismiss the screen/re-arm; do not cancel a pending Telegram retry
+  currentState = STATE_NORMAL;
+  alarmActive = false;
+  setBuzzerTone(0); digitalWrite(PIN_BUZZER, LOW);
+  buzzerOffAt = 0;
+  // Leave sosPending unchanged so failed delivery can still retry in the background.
+  windowOpen = false; pendingCrash = false;
+  crashCooldownUntil = millis() + 3000;
+  sbLatched = true; sbStart = 0;
+  Serial.println("[SOS] Screen dismissed and system re-armed; any pending Telegram retry continues.");
+  showOledDismiss();
+  broadcastJSON("{\"type\":\"cancel\",\"reason\":\"sos_dismissed\"}");
+
+#if ENABLE_BLUETOOTH
+  if (SerialBT.hasClient()) {
+    SerialBT.println("🛡️ [SOS DISMISSED]: System re-armed.");
+  }
+#endif
+}
+
+void updateCrashCountdown() {
+  if (currentState != STATE_CRASH_COUNTDOWN) return;
+  if (millis() - lastCountdownTick >= 1000) {
+    lastCountdownTick += 1000;
+    countdownSeconds--;
+    showOledCrashCountdown(countdownSeconds > 0 ? countdownSeconds : 0);
+
+    String tick = "{";
+    tick += "\"type\":\"countdown\",";
+    tick += "\"seconds_left\":" + String(countdownSeconds) + ",";
+    tick += "\"seconds_remaining\":" + String(countdownSeconds);
+    tick += "}";
+    broadcastJSON(tick);
+
+    if (countdownSeconds <= 0) {
+      Serial.println("[SAFEGUARD] Countdown reached 0 -> AUTO SOS!");
+      bool isRealCrash = (strstr(crashReason, "3-CLICK") == NULL && strstr(crashReason, "MANUAL") == NULL);
+      dispatchSOS("automated_countdown_expiry", crashPeakG, isRealCrash);
+    }
+  }
+}
+
+// ============================================================================
+// MOTION CLASSIFICATION
+// ============================================================================
+void classifyPothole(float g) {
+  if (g < minorPotholeThreshold) {
+    Serial.printf("[MOTION] Ignored (too weak): shock %.2fG (minor pothole starts at %.2fG)\n", g, minorPotholeThreshold);
+    return;
+  }
+  int level = (g >= severePotholeThreshold) ? 3 : (g >= mediumPotholeThreshold) ? 2 : 1;
+  emitPothole(level, g, false);
+}
+
+void checkMotionEvents() {
+  unsigned long now = millis();
+  float peak = peakDyn;
+  peakDyn = 0;
+  bool  impact  = crashImpactSeen;
+  float impactG = crashImpactPeak;
+  crashImpactSeen = false; crashImpactPeak = 0;
+
+  if (!calibrated || currentState != STATE_NORMAL) { windowOpen = false; pendingCrash = false; return; }
+
+  // is the board being tilted / lifted right now?
+  static unsigned long lastTiltSample = 0;
+  static float prevTilt = 0;
+  if (now - lastTiltSample >= 50) {
+    float dtS = (now - lastTiltSample) / 1000.0f;
+    tiltRate = fabsf(tiltDev - prevTilt) / dtS;                // deg per second
+    if (fabsf(tiltDev - prevTilt) > 2.0f) tiltBusyUntil = now + 500;
+    prevTilt = tiltDev; lastTiltSample = now;
+  }
+  bool tiltBusy = (now < tiltBusyUntil) || (tiltDev >= TILT_BUSY_DEG);
+
+  // Wait 3 seconds after boot/calibration before arming automatic motion SOS (prevents false SOS on reset!)
+  if (now - calibratedAtMs < 3000UL) {
+    crashImpactSeen = false;
+    crashImpactPeak = 0;
+    return;
+  }
+
+  // ---- STANDALONE RULE 1: SEVERE CRASH IMPACT FORCE >= 10.0 G ALONE (Immediate SOS, no tilt needed!) ----
+  float maxForceSeen = fmaxf(impactG, fmaxf(peak, fmaxf(shockShown, currentG)));
+  if (now >= crashCooldownUntil && (impact || maxForceSeen >= crashImpactThreshold)) {
+    impactG = maxForceSeen;
+    windowOpen = false;
+    pendingCrash = false;
+    crashCooldownUntil = now + 5000UL;
+    cntCrash++;
+    if (impactG > maxShockG) maxShockG = impactG;
+    snprintf(crashReason, sizeof(crashReason), "FORCE >=10G CRASH");
+    snprintf(sosCustomAlertLine, sizeof(sosCustomAlertLine),
+             "SEVERE CRASH IMPACT: Force %.2f G (>= 10 G Standalone Crash Detected)!",
+             impactG);
+    recordLastEvent("CRASH >=10G", "SEVERE FORCE ALONE", impactG, tiltDev);
+    Serial.printf("[EMERGENCY] STANDALONE CRASH FORCE >= 10G DETECTED (%.2f G) -> SENDING SOS IMMEDIATELY!\n", impactG);
+    dispatchSOS("AUTO_CRASH_FORCE_10G", impactG, true);
+    return;
+  }
+
+  bool moving = DESK_TEST_MODE || !hasGPSFix || curSpeedKmh() >= ROAD_MIN_SPEED_KMH;
+
+  // Use calibrated tiltDev (which is 0.0 deg when resting after calibration!) so a tilted breadboard never false-triggers on reset!
+  float dPitch = ay_g - refY;
+  float dRoll  = ax_g - refX;
+  bool isNegativeTilt = (fabsf(dPitch) >= fabsf(dRoll)) ? (dPitch < 0.0f) : (dRoll < 0.0f);
+  float maxAbsTilt = tiltDev;
+  float signedTilt = isNegativeTilt ? -tiltDev : +tiltDev;
+  const char* tiltDir = isNegativeTilt ? "-NEGATIVE TILT" : "+POSITIVE TILT";
+
+  // Reset tilt SOS latches once vehicle returns below 35 degrees
+  if (maxAbsTilt < 35.0f) {
+    tilt60SosLatched = false;
+    tilt70RolloverLatched = false;
+    tilt60StartMs = 0;
+    tilt70StartMs = 0;
+  }
+
+  // ---- PRIORITY TILT 1: ROLLOVER DETECTION (>= +70 deg or <= -70 deg) ----
+  if (maxAbsTilt >= tiltRolloverDeg) {
+    if (tilt70StartMs == 0) tilt70StartMs = now;
+    // Hold for 300 ms to confirm true rollover and reject single-sample glitches
+    if (!tilt70RolloverLatched && (now - tilt70StartMs >= 300UL)) {
+      tilt70RolloverLatched = true;
+      tilt60SosLatched = true;
+      sbLatched = true;
+      cntCrash++;
+      snprintf(crashReason, sizeof(crashReason), "ROLLOVER >70D");
+      snprintf(sosCustomAlertLine, sizeof(sosCustomAlertLine),
+               "CRITICAL ROLLOVER: Tilt %+.1f deg (%s >= 70 deg)! Vehicle rolled/tipped over!",
+               signedTilt, tiltDir);
+      recordLastEvent("ROLLOVER >70D", "VEHICLE TIPPED OVER", fmaxf(shockShown, currentG), maxAbsTilt);
+      Serial.printf("[EMERGENCY] VEHICLE ROLLOVER DETECTED! Signed Tilt=%+.1f deg (%s)\n", signedTilt, tiltDir);
+      dispatchSOS("AUTO_ROLLOVER_70DEG", fmaxf(shockShown, currentG), true);
+      return;
+    }
+  } else {
+    tilt70StartMs = 0;
+  }
+
+  // ---- PRIORITY TILT 2: HIGH TILT (>60 deg in + or - : May Be Crash or Severe Bump) ----
+  if (maxAbsTilt >= tiltCrashBumpDeg && maxAbsTilt < tiltRolloverDeg) {
+    if (tilt60StartMs == 0) tilt60StartMs = now;
+    // Wait 550 ms so if the vehicle is actively rolling past 70 deg, it triggers the 70 deg Rollover above;
+    // if it stays between 60 and 70 deg, send the >60 deg "Tilt: May Be Crash or Bump" SOS!
+    if (!tilt60SosLatched && (now - tilt60StartMs >= 550UL)) {
+      tilt60SosLatched = true;
+      sbLatched = true;
+      snprintf(crashReason, sizeof(crashReason), "TILT >60D CRASH/BMP");
+      snprintf(sosCustomAlertLine, sizeof(sosCustomAlertLine),
+               "HIGH TILT ALERT: Tilt %+.1f deg (%s > 60 deg) - May be a Crash or Severe Bump!",
+               signedTilt, tiltDir);
+      recordLastEvent("TILT >60D ALERT", "MAY BE CRASH/BUMP", fmaxf(shockShown, currentG), maxAbsTilt);
+      Serial.printf("[EMERGENCY] HIGH TILT (>60 DEG) DETECTED! Signed Tilt=%+.1f deg (%s)\n", signedTilt, tiltDir);
+      dispatchSOS("AUTO_TILT_60DEG", fmaxf(shockShown, currentG), true);
+      return;
+    }
+  } else if (maxAbsTilt < tiltCrashBumpDeg) {
+    tilt60StartMs = 0;
+  }
+
+  // ---- SPEED BREAKER / BUMP: 25 deg to < 60 deg tilt held for 0.4s ----
+  if (moving && maxAbsTilt < tiltCrashBumpDeg) {
+    if (!sbLatched) {
+      if (tiltDev >= speedBreakerMinTilt) {
+        if (sbStart == 0) sbStart = now;
+        if (tiltDev > sbPeakTilt) sbPeakTilt = tiltDev;
+        // fire once it has been up for SB_HOLD_MS AND has stopped moving (so the angle shown is the final one)
+        if (now - sbStart >= SB_HOLD_MS && (tiltRate < 25.0f || now - sbStart >= SB_MAX_WAIT_MS)) {
+          sbLatched = true;
+          lastRoadEventTime = now;
+          windowOpen = false;
+          emitSpeedBreaker(sbPeakTilt);
+        }
+      } else { sbStart = 0; sbPeakTilt = 0; }
+    } else if (tiltDev < SB_RELEASE_DEG) {
+      sbLatched = false; sbStart = 0; sbPeakTilt = 0;
+    }
+  }
+
+  // ---- POTHOLE: short sharp shock while the board is NOT being tilted ----
+  if (!windowOpen) {
+    if (moving && !tiltBusy && !sbLatched && now - lastRoadEventTime >= POTHOLE_DEBOUNCE_MS && peak >= WINDOW_OPEN_G) {
+      windowOpen = true; windowStart = now; wMaxG = peak;
+    }
+  } else {
+    if (peak > wMaxG) wMaxG = peak;
+    if (now - windowStart >= ROAD_WINDOW_MS) {
+      windowOpen = false;
+      lastRoadEventTime = now;
+      if (tiltBusy || sbLatched) Serial.printf("[MOTION] Ignored: board was being tilted (shock %.2fG)\n", wMaxG);
+      else classifyPothole(wMaxG);
+    }
+  }
+}
+
+// ============================================================================
+// BUTTON (Multi-Click: 1 Click=Last Event | 2 Clicks=Log | 3 Clicks=15s SOS)
+// Uses the physical tactile switch only (active LOW). Capacitive touch backup is disabled to prevent false triggers.
+// Press during countdown immediately turns off/cancels the alarm!
+// ============================================================================
+void checkPhysicalButton() {
+  static bool bootGuard = true;
+  static bool lastPolledLow = false;
+  static unsigned long buttonDownTime = 0;
+  static bool holdConsumed = false;
+
+  unsigned long now = millis();
+
+  if (bootGuard) {
+    bootGuard = false;
+    isrButtonPressQueue = 0;
+    Serial.println("[BUTTON] Hardware Interrupt + Debounce active on GPIO" + String(PIN_BUTTON));
+    Serial.printf("[BUTTON] Initial digitalRead(GPIO%d)=%d (idle should be HIGH=1)\n",
+                  PIN_BUTTON, digitalRead(PIN_BUTTON));
+  }
+
+  // Track physical button hold state for 3-second hold backup
+  bool currentlyLow = (digitalRead(PIN_BUTTON) == LOW);
+  if (currentlyLow && !lastPolledLow) {
+    buttonDownTime = now;
+    holdConsumed = false;
+    if (isrButtonPressQueue == 0 && (micros() - lastIsrFallUs > 60000UL)) {
+      lastIsrFallUs = micros();
+      isrButtonPressQueue = 1;
+    }
+  } else if (!currentlyLow) {
+    lastPolledLow = false;
+  }
+  lastPolledLow = currentlyLow;
+
+  // Process all button presses captured by the hardware ISR
+  while (isrButtonPressQueue > 0) {
+    noInterrupts();
+    isrButtonPressQueue--;
+    interrupts();
+
+    // 1. If in AUTOMATIC CRASH COUNTDOWN, pressing the button cancels the false alarm
+    if (currentState == STATE_CRASH_COUNTDOWN) {
+      isrButtonPressQueue = 0;
+      sosPressCount = 0;
+      cancelAlarm("physical_button");
+      return;
+    }
+
+    // 2. If SOS was ALREADY DISPATCHED:
+    //    Ignore extra clicks for the first 3 seconds so rapid/continuous clicking
+    //    NEVER cancels or hides the SOS that was just triggered!
+    if (currentState == STATE_SOS_DISPATCHED) {
+      isrButtonPressQueue = 0;
+      sosPressCount = 0;
+      if (now - sosDispatchedAtMs >= 3000UL) {
+        dismissSOS();
+      } else {
+        Serial.println("[BUTTON] Extra click ignored while SOS is sending/active.");
+      }
+      return;
+    }
+
+    // 3. NORMAL STATE: 3-Press Sequence (Reset if > 3 seconds elapsed since previous press)
+    if (sosPressCount > 0 && (now - lastSosPressMs > SOS_SEQUENCE_WINDOW_MS)) {
+      sosPressCount = 0;
+    }
+
+    sosPressCount++;
+    lastSosPressMs = now;
+
+    if (sosPressCount == 1) {
+      // FIRST PRESS: Display saved Last Event and count first press (1/3)
+      playBuzzerPattern(1, 35, 30, 2100);
+      Serial.println("[BUTTON] SOS PRESS: 1/3 -> Showing Saved Last Event");
+      buttonLastEventRequestId++;
+      infoPage = 1;
+      infoPageUntil = now + INFO_PAGE_MS;
+      oledHoldUntil = 0;
+      drawInfoPage(1);
+
+    } else if (sosPressCount == 2) {
+      // SECOND PRESS WITHIN 3 SECONDS: Display "SOS PRESS: 2/3" AND Recent Event Log & Details!
+      playBuzzerPattern(2, 35, 40, 2400);
+      Serial.println("[BUTTON] SOS PRESS: 2/3 -> Showing Event List & Details (Press 1 more time within 3s for SOS)");
+      infoPage = 2;
+      infoPageUntil = now + INFO_PAGE_MS;
+      oledHoldUntil = 0;
+      drawInfoPage(2);
+
+    } else if (sosPressCount >= 3) {
+      // THIRD PRESS WITHIN 3 SECONDS: Immediately trigger Manual SOS alert!
+      isrButtonPressQueue = 0;
+      sosPressCount = 0;
+      sosCustomAlertLine[0] = 0;
+      Serial.println("[BUTTON] SOS PRESS: 3/3 -> TRIGGERING MANUAL SOS IMMEDIATELY!");
+      dispatchSOS("MANUAL_3_PRESS", fmaxf(shockShown, currentG), false);
+      return;
+    }
+  }
+
+  // Reset the sequence if the next press does not occur within 3 seconds
+  if (sosPressCount > 0 && (now - lastSosPressMs > SOS_SEQUENCE_WINDOW_MS)) {
+    Serial.println("[BUTTON] 3-second sequence window expired. Resetting SOS press count to 0/3.");
+    sosPressCount = 0;
+    if (infoPage == 1 || infoPage == 2) {
+      drawInfoPage(infoPage);
+    }
+  }
+
+  // 3-second continuous hold backup: also triggers SOS directly
+  if (currentlyLow && !holdConsumed && currentState == STATE_NORMAL) {
+    if (now - buttonDownTime >= 3000UL) {
+      holdConsumed = true;
+      isrButtonPressQueue = 0;
+      sosPressCount = 0;
+      sosCustomAlertLine[0] = 0;
+      Serial.println("[BUTTON] 3s Hold -> TRIGGERING MANUAL SOS IMMEDIATELY!");
+      dispatchSOS("MANUAL_3S_HOLD", fmaxf(shockShown, currentG), false);
+    }
+  }
+}
+
+// ============================================================================
+// COMMANDS (Serial + UDP + Bluetooth)
+// ============================================================================
+void checkIncomingSerialCommands() {
+  while (Serial.available() > 0) {
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) handleIncomingCommand(line);
+  }
+}
+
+#if ENABLE_BLUETOOTH
+void checkIncomingBtCommands() {
+  while (SerialBT.available() > 0) {
+    String cmd = SerialBT.readStringUntil('\n');
+    cmd.trim();
+    if (cmd.length() > 0) {
+      Serial.println("[BT RX] " + cmd);
+      handleIncomingCommand(cmd);
+      SerialBT.println("ACK: " + cmd);
+    }
+  }
+}
+#endif
+
+void checkIncomingUdpCommands() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  int packetSize = udp.parsePacket();
+  if (packetSize > 0) {
+    char buf[256];
+    IPAddress from = udp.remoteIP();
+    int len = udp.read(buf, sizeof(buf) - 1);
+    if (len <= 0) return;
+    if (from == WiFi.localIP()) return;        // ignore our own broadcast
+    buf[len] = '\0';
+    String cmd = String(buf);
+    cmd.trim();
+    Serial.println("[UDP RX] " + cmd);
+    handleIncomingCommand(cmd);
+  }
+}
+
+static bool getSetting(const String& s, const char* key, float& out) {
+  String k = String(key) + "\":";
+  int i = s.indexOf(k);
+  if (i < 0) return false;
+  out = s.substring(i + k.length()).toFloat();
+  return true;
+}
+
+static void applySettings(const String& lower) {
+  float v;
+  if (getSetting(lower, "crash_g", v)          && v >= 1.5f && v <= 10.0f) crashImpactThreshold = v;
+  if (getSetting(lower, "minor_pothole_g", v)  && v >= 0.2f && v <= 5.0f)  minorPotholeThreshold = v;
+  if (getSetting(lower, "medium_pothole_g", v) && v >= 0.2f && v <= 8.0f)  mediumPotholeThreshold = v;
+  if (getSetting(lower, "severe_pothole_g", v) && v >= 0.2f && v <= 8.0f)  severePotholeThreshold = v;
+  if (mediumPotholeThreshold < minorPotholeThreshold)  mediumPotholeThreshold = minorPotholeThreshold;
+  if (severePotholeThreshold < mediumPotholeThreshold) severePotholeThreshold = mediumPotholeThreshold;
+  Serial.println("[SETTINGS] Crash=" + String(crashImpactThreshold, 2) + "G Minor=" + String(minorPotholeThreshold, 2) +
+                 "G Medium=" + String(mediumPotholeThreshold, 2) + "G Severe=" + String(severePotholeThreshold, 2) + "G");
+}
+
+void handleIncomingCommand(const String& payload) {
+  String lower = payload;
+  lower.toLowerCase();
+  lower.trim();
+
+  // 1) settings FIRST (its text contains "pothole")
+  if (lower.indexOf("settings") >= 0) { applySettings(lower); return; }
+
+  // 2) ignore our own output messages if they ever get echoed back
+  if (lower.startsWith("{\"type\":\"telemetry\"") || lower.startsWith("{\"type\":\"crash_detected\"") ||
+      lower.startsWith("{\"type\":\"pothole\"")   || lower.startsWith("{\"type\":\"bump\"") ||
+      lower.startsWith("{\"type\":\"speed_breaker\"") || lower.startsWith("{\"type\":\"countdown\"") ||
+      lower.startsWith("{\"type\":\"button_ping\"") || lower.startsWith("{\"type\":\"last_event\"") ||
+      lower.indexOf("\"mode\"") >= 0 || lower.indexOf("\"reason\"") >= 0) return;
+
+  // 3) commands
+  if (lower == "gpsraw") {
+    gpsRaw = !gpsRaw;
+    Serial.println(String("[GPS] raw sentence printing ") + (gpsRaw ? "ON" : "OFF"));
+  } else if (lower == "cal" || lower.indexOf("calibrate") >= 0) {
+    requestCalibration();
+  } else if (lower == "info") {
+    printStatus();
+    if (calibrated && currentState == STATE_NORMAL) nextInfoPage();
+  } else if (lower.indexOf("cancel") >= 0) {
+    if (currentState == STATE_SOS_DISPATCHED) dismissSOS(); else cancelAlarm("command");
+  } else if (lower.indexOf("sos") >= 0) {
+    sosCustomAlertLine[0] = 0;
+    dispatchSOS("COMMAND_SOS", fmaxf(shockShown, currentG), false);
+  } else if (lower.indexOf("crash") >= 0) {
+    startCrash("SIMULATED", 5.2f);
+  } else if (lower.indexOf("speed") >= 0) {
+    emitSpeedBreaker(30.0f);
+  } else if (lower.indexOf("pothole") >= 0) {
+    int level = (lower.indexOf("minor") >= 0) ? 1 : (lower.indexOf("medium") >= 0) ? 2 : 3;
+    emitPothole(level, level == 1 ? 1.50f : (level == 2 ? 2.20f : 3.00f), false);
+  } else if (lower.indexOf("bump") >= 0) {
+    emitPothole(1, 1.50f, false);
+  }
+}
+
+void printStatus() {
+  Serial.printf("[STATUS] MPU=%s calibrated=%s tilt=%.1f shock=%.2f speed=%.1f\n",
+                mpuConnected ? "OK" : "LOST", calibrated ? "yes" : "NO", tiltDev, shockShown, curSpeedKmh());
+  Serial.printf("[STATUS] events: minor=%u medium=%u severe=%u speed_breaker=%u crash=%u sos=%u maxShock=%.2fG\n",
+                cntMinor, cntMedium, cntSevere, cntSpeedBreaker, cntCrash, cntSOS, maxShockG);
+  Serial.printf("[STATUS] GPS fix=%s sats=%d bytes=%lu good=%lu bad=%lu | WiFi=%s\n",
+                hasGPSFix ? "yes" : "NO", realSatellites, totalGpsBytes, gpsGoodSentences, gpsBadSentences,
+                WiFi.status() == WL_CONNECTED ? "OK" : "OFFLINE");
+}
+
+// ============================================================================
+// SOS MESSAGE TEXT + TELEGRAM BOT API
+// ============================================================================
+static String urlEncode(const String& s) {
+  String out;
+  const char* hex = "0123456789ABCDEF";
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s.charAt(i);
+    if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '-' || c == '_' || c == '.' || c == '~') out += c;
+    else if (c == ' ') out += '+';
+    else { out += '%'; out += hex[(c >> 4) & 15]; out += hex[c & 15]; }
+  }
+  return out;
+}
+
+String buildSosText() {
+  const EvtRec* lastEvt = newestEvt(0);
+  float dPitch = ay_g - refY;
+  float dRoll  = ax_g - refX;
+  bool isNeg = (fabsf(dPitch) >= fabsf(dRoll)) ? (dPitch < 0.0f) : (dRoll < 0.0f);
+  float signedTilt = isNeg ? -tiltDev : +tiltDev;
+
+  String evtName;
+  if (sosCustomAlertLine[0] != 0) {
+    evtName = String(sosCustomAlertLine);
+  } else if (tiltDev >= tiltRolloverDeg) {
+    evtName = "CRITICAL VEHICLE ROLLOVER (>= +/-70 DEG) - Vehicle tipped/rolled over!";
+  } else if (tiltDev >= tiltCrashBumpDeg) {
+    evtName = "HIGH TILT ALERT (>= +/-60 DEG) - Tilt may be a Crash or Severe Bump!";
+  } else if (sosIsCrash) {
+    evtName = String("AUTOMATIC CRASH (") + String(crashReason) + ")";
+  } else {
+    evtName = String("MANUAL 3-CLICK SOS (Last Event: ") + String(lastEvt ? lastEvt->tag : "NONE") + ")";
+  }
+
+  String msg = "AEGIS RIDE EMERGENCY SOS\n";
+  msg += "Event: " + evtName + "\n";
+  msg += "Tilt: " + String(signedTilt, 1) + " deg\n";
+  msg += "Impact Force: " + String(sosG, 2) + " G | Speed: " + String(curSpeedKmh(), 1) + " km/h\n";
+  msg += "Battery: " + String(batteryPercentage) + "% (" + String(batteryVoltage, 2) + " V)\n";
+
+  double lat = getEffectiveLat();
+  double lng = getEffectiveLng();
+  msg += "Rider Current Location: " + String(riderAreaName) + "\n";
+  msg += "Current Coords: " + String(lat, 6) + ", " + String(lng, 6) + "\n";
+  msg += "Location Source: " + String(getLocationSourceTag()) + "\n";
+  msg += "Google Maps Pin: https://maps.google.com/?q=" + String(lat, 6) + "," + String(lng, 6);
+  return msg;
+}
+
+static bool telegramConfigured() {
+  return TELEGRAM_BOT_TOKEN[0] && TELEGRAM_CHAT_ID[0] &&
+         String(TELEGRAM_BOT_TOKEN) != "YOUR_TELEGRAM_BOT_TOKEN" &&
+         String(TELEGRAM_CHAT_ID) != "YOUR_TELEGRAM_CHAT_ID";
+}
+
+bool sendTelegramSOS(const String& msg) {
+  if (!telegramConfigured()) {
+    snprintf(sosDetail, sizeof(sosDetail), "SET TOKEN/CHAT ID");
+    Serial.println("[TELEGRAM] Not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.");
+    return false;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    snprintf(sosDetail, sizeof(sosDetail), "WIFI THILLAI OFF");
+    Serial.println("[TELEGRAM] No internet on Wi-Fi station; SOS cannot reach Telegram.");
+    return false;
+  }
+  Serial.printf("[TELEGRAM] Free heap before HTTPS: %u bytes\n", ESP.getFreeHeap());
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(6000);
+  HTTPClient http;
+  http.setTimeout(6000);
+  String url = "https://api.telegram.org/bot" + String(TELEGRAM_BOT_TOKEN) + "/sendMessage";
+  String body = "chat_id=" + urlEncode(String(TELEGRAM_CHAT_ID)) + "&text=" + urlEncode(msg);
+  bool ok = false;
+  if (http.begin(client, url)) {
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    int code = http.POST(body);
+    String response = http.getString();
+    ok = (code == 200 && response.indexOf("\"ok\":true") >= 0);
+    Serial.printf("[TELEGRAM] sendMessage HTTP status: %d\n", code);
+    Serial.println(String("[TELEGRAM] API response: ") + response);
+    if (ok) {
+      snprintf(sosDetail, sizeof(sosDetail), "DELIVERED TO TG!");
+    } else if (code == 400) {
+      snprintf(sosDetail, sizeof(sosDetail), "TG 400: START BOT");
+    } else if (code == 401 || code == 404) {
+      snprintf(sosDetail, sizeof(sosDetail), "TG %d: BAD TOKEN", code);
+    } else if (code < 0) {
+      snprintf(sosDetail, sizeof(sosDetail), "NO INTERNET DATA");
+    } else {
+      snprintf(sosDetail, sizeof(sosDetail), "TG HTTP ERR: %d", code);
+    }
+    http.end();
+  } else {
+    snprintf(sosDetail, sizeof(sosDetail), "HTTPS INIT FAILED");
+    Serial.println("[TELEGRAM] Could not start HTTPS request.");
+  }
+  return ok;
+}
+
+// Checks if you ever sent a Location Pin in your Telegram Bot chat (persists across ESP32 resets!)
+void fetchTelegramLocationPin() {
+  if (!telegramConfigured() || WiFi.status() != WL_CONNECTED) return;
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(3500);
+  HTTPClient http;
+  http.setTimeout(3500);
+  String url = "https://api.telegram.org/bot" + String(TELEGRAM_BOT_TOKEN) + "/getUpdates?offset=-5&limit=5";
+  if (http.begin(client, url)) {
+    int code = http.GET();
+    if (code == 200) {
+      String res = http.getString();
+      int locIdx = res.lastIndexOf("\"location\":{");
+      if (locIdx >= 0) {
+        int latIdx = res.indexOf("\"latitude\":", locIdx);
+        int lngIdx = res.indexOf("\"longitude\":", locIdx);
+        if (latIdx >= 0 && lngIdx >= 0) {
+          double tLat = res.substring(latIdx + 11).toDouble();
+          double tLng = res.substring(lngIdx + 12).toDouble();
+          if (tLat != 0.0 && tLng != 0.0 && fabs(tLat) <= 90.0 && fabs(tLng) <= 180.0) {
+            phoneLat = tLat;
+            phoneLng = tLng;
+            hasPhoneFix = true;
+            hasTelegramPin = true;
+            strncpy(riderAreaName, "Exact GPS Pin (Chennai)", sizeof(riderAreaName) - 1);
+            Serial.printf("[TG GPS PIN] Exact Phone GPS locked: %.6f, %.6f\n", phoneLat, phoneLng);
+          }
+        }
+      }
+    }
+    http.end();
+  }
+}
+
+// Method 3: Automatically fetches the rider's current latitude/longitude & area from the Hotspot internet connection
+void fetchNetworkCurrentLocation() {
+  if (WiFi.status() != WL_CONNECTED || hasGPSFix || hasPhoneFix) return;
+  HTTPClient http;
+  http.setTimeout(3500);
+  if (http.begin("http://ip-api.com/line/?fields=status,city,regionName,district,lat,lon")) {
+    int code = http.GET();
+    if (code == 200) {
+      String payload = http.getString();
+      int l1 = payload.indexOf('\n');
+      String status = (l1 > 0) ? payload.substring(0, l1) : "";
+      status.trim();
+      if (status == "success") {
+        int l2 = payload.indexOf('\n', l1 + 1);
+        int l3 = payload.indexOf('\n', l2 + 1);
+        int l4 = payload.indexOf('\n', l3 + 1);
+        int l5 = payload.indexOf('\n', l4 + 1);
+        int l6 = payload.indexOf('\n', l5 + 1);
+        if (l2 > 0 && l3 > 0 && l4 > 0 && l5 > 0) {
+          String city     = payload.substring(l1 + 1, l2); city.trim();
+          String region   = payload.substring(l2 + 1, l3); region.trim();
+          String district = payload.substring(l3 + 1, l4); district.trim();
+          double fLat     = payload.substring(l4 + 1, l5).toDouble();
+          double fLng     = (l6 > 0 ? payload.substring(l5 + 1, l6) : payload.substring(l5 + 1)).toDouble();
+          if (fLat != 0.0 && fLng != 0.0) {
+            netLat = fLat;
+            netLng = fLng;
+            hasNetLocation = true;
+            String area = (district.length() > 0 && district != city) ? (district + ", " + city) : (city + ", " + region);
+            strncpy(riderAreaName, area.c_str(), sizeof(riderAreaName) - 1);
+            riderAreaName[sizeof(riderAreaName) - 1] = 0;
+            Serial.printf("[METHOD 3 AUTO GPS] Rider Current Location: %s (%.6f, %.6f)\n",
+                          riderAreaName, netLat, netLng);
+          }
+        }
+      }
+    }
+    http.end();
+  }
+}
+
+// Sends a native interactive Telegram Map Pin (/sendLocation) to the chat when SOS triggers!
+void sendTelegramLocationPin(double lat, double lng) {
+  if (!telegramConfigured() || WiFi.status() != WL_CONNECTED) return;
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(5000);
+  HTTPClient http;
+  http.setTimeout(5000);
+  String url = "https://api.telegram.org/bot" + String(TELEGRAM_BOT_TOKEN) + "/sendLocation";
+  String body = "chat_id=" + urlEncode(String(TELEGRAM_CHAT_ID)) +
+                "&latitude=" + String(lat, 6) +
+                "&longitude=" + String(lng, 6);
+  if (http.begin(client, url)) {
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    int code = http.POST(body);
+    Serial.printf("[TELEGRAM] sendLocation Map Pin HTTP status: %d\n", code);
+    http.end();
+  }
+}
+
+void attemptSOS() {
+  lastSosAttempt = millis();
+  sosAttempts++;
+
+  // If Wi-Fi is not connected yet, actively try connecting to WIFI_SSID ("Thillai") for up to 5 seconds
+  if (WiFi.status() != WL_CONNECTED && String(WIFI_SSID).length() > 0) {
+    snprintf(sosStatus, sizeof(sosStatus), "SENDING SOS...");
+    snprintf(sosDetail, sizeof(sosDetail), "JOINING WIFI...");
+    showOledSosDispatched();
+    Serial.printf("[TELEGRAM] Wi-Fi not connected. Attempting to join '%s'...\n", WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 5000UL) {
+      delay(150);
+      Serial.print(".");
+    }
+    Serial.println();
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    snprintf(sosStatus, sizeof(sosStatus), "SOS FAILED");
+    snprintf(sosDetail, sizeof(sosDetail), "WIFI THILLAI OFF");
+    Serial.println("[TELEGRAM] SOS FAILED: ESP32 could not connect to Wi-Fi hotspot '" + String(WIFI_SSID) + "'.");
+    if (sosAttempts >= SOS_MAX_ATTEMPTS) sosPending = false;
+  } else {
+    snprintf(sosStatus, sizeof(sosStatus), "SENDING SOS...");
+    snprintf(sosDetail, sizeof(sosDetail), "WIFI OK->TELEGRAM");
+    showOledSosDispatched();
+
+    if (!hasGPSFix) {
+      if (!hasPhoneFix && !hasNetLocation) fetchNetworkCurrentLocation();
+      if (!hasPhoneFix) fetchTelegramLocationPin();
+    }
+    bool sent = sendTelegramSOS(buildSosText());
+    if (sent) {
+      sosPending = false;
+      snprintf(sosStatus, sizeof(sosStatus), "SOS SENT");
+      Serial.println("[TELEGRAM] SOS SENT: Confirmed by Telegram API. Sending interactive Map Pin...");
+      sendTelegramLocationPin(getEffectiveLat(), getEffectiveLng());
+      broadcastJSON("{\"type\":\"sos_status\",\"sent\":1,\"attempt\":" + String(sosAttempts) + "}");
+    } else {
+      snprintf(sosStatus, sizeof(sosStatus), "SOS FAILED");
+      if (sosAttempts >= SOS_MAX_ATTEMPTS) {
+        sosPending = false;
+        broadcastJSON("{\"type\":\"sos_status\",\"sent\":0,\"attempt\":" + String(sosAttempts) + "}");
+      } else {
+        Serial.println("[TELEGRAM] SOS FAILED on this attempt; will retry in background.");
+      }
+    }
+  }
+  sosStatusShownUntilMs = millis() + SOS_TEMP_BANNER_MS;
+  if (currentState == STATE_SOS_DISPATCHED) showOledSosDispatched();
+}
+
+void serviceSosRetry() {
+  // Retries continue even if the SOS display has been dismissed/re-armed.
+  if (!sosPending) return;
+  if (millis() - lastSosAttempt >= SOS_RETRY_MS) attemptSOS();
+}
+
+// ============================================================================
+// BUZZER / BROADCAST
+// ============================================================================
+void setBuzzerTone(int freqHz) {
+  if (freqHz <= 0 || !buzzerAudioEnabled) {
+    digitalWrite(PIN_BUZZER, LOW);
+    return;
+  }
+  digitalWrite(PIN_BUZZER, HIGH);
+}
+
+void playBuzzerPattern(int pulses, int onMs, int gapMs, int freqHz) {
+  if (!buzzerAudioEnabled || pulses <= 0) return;
+  buzzerPulsesLeft  = pulses;
+  buzzerPulseOnMs   = onMs;
+  buzzerPulseGapMs  = gapMs;
+  buzzerPulseFreqHz = (freqHz > 0) ? freqHz : 2000;
+  buzzerPulseHigh   = true;
+  setBuzzerTone(buzzerPulseFreqHz);
+  buzzerNextEdgeMs  = millis() + (unsigned long)onMs;
+  buzzerOffAt       = 0;
+}
+
+void triggerBuzzer(int freqHz, int durationMs) {
+  playBuzzerPattern(1, durationMs, 40, freqHz);
+}
+
+void updateBuzzer() {
+  unsigned long now = millis();
+
+  if (alarmActive && buzzerAudioEnabled) {
+    unsigned long phase = now % 1000UL;
+    bool chirpOn = (phase < 90UL) || (phase >= 160UL && phase < 250UL);
+    setBuzzerTone(chirpOn ? 2400 : 0);
+    return;
+  }
+
+  if (buzzerPulsesLeft > 0) {
+    if ((long)(now - buzzerNextEdgeMs) >= 0) {
+      if (buzzerPulseHigh) {
+        buzzerPulseHigh = false;
+        setBuzzerTone(0);
+        buzzerPulsesLeft--;
+        if (buzzerPulsesLeft > 0) {
+          buzzerNextEdgeMs = now + (unsigned long)buzzerPulseGapMs;
+        }
+      } else {
+        buzzerPulseHigh = true;
+        setBuzzerTone(buzzerPulseFreqHz);
+        buzzerNextEdgeMs = now + (unsigned long)buzzerPulseOnMs;
+      }
+    }
+    return;
+  }
+
+  if (buzzerOffAt != 0 && (long)(now - buzzerOffAt) >= 0) {
+    setBuzzerTone(0);
+    buzzerOffAt = 0;
+  }
+}
+
+void broadcastJSON(const String& json) {
+  const char* c = json.c_str();
+  size_t len = json.length(), i = 0;
+  while (i < len) {
+    size_t n = (len - i > 16) ? 16 : (len - i);
+    Serial.write((const uint8_t*)(c + i), n);
+    i += n;
+    readMPU6050();                      // sample between small Serial chunks
+  }
+  Serial.write('\n');
+  if (WiFi.status() == WL_CONNECTED) {
+    udp.beginPacket("255.255.255.255", 8888);
+    udp.print(json);
+    udp.endPacket();
+  }
+#if ENABLE_BLUETOOTH
+  if (SerialBT.hasClient()) {
+    SerialBT.println(json);
+  }
+#endif
+}
+
+// ============================================================================
+// GPS (NMEA with checksum + safe field parsing)
+// ============================================================================
+static bool nmeaChecksumOk(const String& s) {
+  int star = s.indexOf('*');
+  if (star < 1 || (int)s.length() < star + 3) return false;
+  uint8_t cs = 0;
+  for (int i = 1; i < star; i++) cs ^= (uint8_t)s.charAt(i);
+  uint8_t given = (uint8_t)strtol(s.substring(star + 1, star + 3).c_str(), NULL, 16);
+  return cs == given;
+}
+
+static String getField(const String& s, int n) {       // n=0 is the sentence id ("$GPRMC")
+  int start = 0;
+  for (int i = 0; i < n; i++) {
+    start = s.indexOf(',', start);
+    if (start < 0) return "";
+    start++;
+  }
+  int end = s.indexOf(',', start);
+  int star = s.indexOf('*', start);
+  if (end < 0 || (star >= 0 && star < end)) end = (star >= 0) ? star : s.length();
+  return s.substring(start, end);
+}
+
+static bool parseNmeaCoord(const String& v, const String& hem, int degDigits, double& out) {
+  if ((int)v.length() < degDigits + 2) return false;
+  double deg = v.substring(0, degDigits).toDouble();
+  double minutes = v.substring(degDigits).toDouble();
+  double val = deg + minutes / 60.0;
+  if (hem == "S" || hem == "W") val = -val;
+  out = val;
+  return true;
+}
+
+static void markFix() {
+  hasGPSFix = true;
+  hasEverHadFix = true;
+  lastValidGPSTime = millis();
+}
+
+void parseNMEASentence(const String& s) {
+  if (s.length() < 10) return;
+  if (!nmeaChecksumOk(s)) { gpsBadSentences++; return; }
+  gpsGoodSentences++;
+  String type = getField(s, 0).substring(3);   // "RMC", "GGA", "GSV"...
+  double v;
+
+  if (type == "RMC") {
+    if (getField(s, 2) == "A") {
+      double lat = 0.0, lng = 0.0;
+      bool latOK = parseNmeaCoord(getField(s, 3), getField(s, 4), 2, lat);
+      bool lngOK = parseNmeaCoord(getField(s, 5), getField(s, 6), 3, lng);
+      if (latOK && lngOK && fabs(lat) <= 90.0 && fabs(lng) <= 180.0 && (lat != 0.0 || lng != 0.0)) {
+        realLat = lat; realLng = lng; markFix();
+      }
+      String spd = getField(s, 7);
+      if (spd.length() > 0) realSpeedKmh = spd.toFloat() * 1.852f;
+    } else {
+      hasGPSFix = false;
+      realSpeedKmh = 0;
+    }
+  } else if (type == "GGA") {
+    satsUsed = getField(s, 7).toInt();
+    String q = getField(s, 6);
+    if (q.length() > 0 && q != "0") {
+      double lat = 0.0, lng = 0.0;
+      bool latOK = parseNmeaCoord(getField(s, 2), getField(s, 3), 2, lat);
+      bool lngOK = parseNmeaCoord(getField(s, 4), getField(s, 5), 3, lng);
+      if (latOK && lngOK && fabs(lat) <= 90.0 && fabs(lng) <= 180.0 && (lat != 0.0 || lng != 0.0)) {
+        realLat = lat; realLng = lng; markFix();
+      }
+    } else {
+      hasGPSFix = false;
+    }
+  } else if (type == "GSV") {
+    String inView = getField(s, 3);
+    if (inView.length() > 0) satsInView = inView.toInt();
+  }
+  realSatellites = hasGPSFix ? satsUsed : satsInView;
+}
+
+void readGPSModule() {
+  static String nmea = "";
+  static bool firstByteLogged = false;
+  static unsigned long lastDiag = 0, lastBaudSwitch = 0, lastGpsRestart = 0;
+
+  while (gpsSerial.available() > 0) {
+    char c = gpsSerial.read();
+    totalGpsBytes++;
+    lastGpsByteTime = millis();
+    if (!firstByteLogged) { firstByteLogged = true; Serial.println("[GPS] Receiving data from module."); }
+
+    if (c == '\n') {
+      nmea.trim();
+      if (gpsRaw && nmea.length() > 0) Serial.println("[NMEA] " + nmea);
+      if (nmea.length() > 0 && nmea.charAt(0) == '$') parseNMEASentence(nmea);
+      nmea = "";
+    } else if (c != '\r') {
+      if (nmea.length() < 120) nmea += c; else nmea = "";
+    }
+  }
+
+  // bytes arrive but nothing is valid NMEA -> wrong baud rate (some modules use 38400 / 115200)
+  if (totalGpsBytes > 200 && gpsGoodSentences == 0 && millis() - lastGpsByteTime < 2000 && millis() - lastBaudSwitch > 6000) {
+    lastBaudSwitch = millis();
+    gpsBaudIdx = (gpsBaudIdx + 1) % 4;
+    gpsSerial.updateBaudRate(GPS_BAUDS[gpsBaudIdx]);
+    Serial.printf("[GPS] Data but no valid NMEA -> trying %lu baud\n", GPS_BAUDS[gpsBaudIdx]);
+  }
+
+  if (millis() - lastGpsByteTime > 10000 && millis() - lastGpsRestart > 10000) {
+    lastGpsRestart = millis();
+    Serial.println("[GPS] Silent for 10 s -> restarting UART2 (check wires if this repeats)");
+    gpsSerial.end();
+    gpsSerial.setRxBufferSize(1024);
+    gpsSerial.begin(GPS_BAUDS[gpsBaudIdx], SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
+  }
+
+  if (hasGPSFix && millis() - lastValidGPSTime > 5000) {
+    hasGPSFix = false;
+    realSpeedKmh = 0;
+    realSatellites = satsInView;
+  }
+
+  if (millis() - lastDiag > 5000) {              // plain-English GPS status every 5 s
+    lastDiag = millis();
+    const char* st;
+    if (totalGpsBytes == 0 || millis() - lastGpsByteTime > 3000) st = "NO DATA from module -> check wiring (GPS TX->GPIO16), GND, 5V";
+    else if (gpsGoodSentences == 0)                              st = "DATA but invalid -> baud/wiring noise";
+    else if (!hasGPSFix)                                         st = "Module OK, SEARCHING for satellites (needs open sky - will not lock indoors)";
+    else                                                         st = "FIX OK";
+    Serial.printf("[GPS] %s | bytes=%lu good=%lu bad=%lu used=%d inview=%d\n",
+                  st, totalGpsBytes, gpsGoodSentences, gpsBadSentences, satsUsed, satsInView);
+  }
+}
+
+// ============================================================================
+// OLED (pure Wire.h SSD1306, 5x7 font, UPPER-CASE only, 21 chars per line)
+// ============================================================================
+void ssd1306_cmd(uint8_t c) {
+  Wire.beginTransmission(oledAddress);
+  Wire.write(0x00);
+  Wire.write(c);
+  Wire.endTransmission();
+}
+
+static const uint8_t font5x7[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x5F,0x00,0x00, 0x00,0x07,0x00,0x07,0x00, 0x14,0x7F,0x14,0x7F,0x14,
+  0x24,0x2A,0x7F,0x2A,0x12, 0x23,0x13,0x08,0x64,0x62, 0x36,0x49,0x55,0x22,0x50, 0x00,0x05,0x03,0x00,0x00,
+  0x00,0x1C,0x22,0x41,0x00, 0x00,0x41,0x22,0x1C,0x00, 0x14,0x08,0x3E,0x08,0x14, 0x08,0x08,0x3E,0x08,0x08,
+  0x00,0x50,0x30,0x00,0x00, 0x08,0x08,0x08,0x08,0x08, 0x00,0x60,0x60,0x00,0x00, 0x20,0x10,0x08,0x04,0x02,
+  0x3E,0x51,0x49,0x45,0x3E, 0x00,0x42,0x7F,0x40,0x00, 0x42,0x61,0x51,0x49,0x46, 0x21,0x41,0x45,0x4B,0x31,
+  0x18,0x14,0x12,0x7F,0x10, 0x27,0x45,0x45,0x45,0x39, 0x3C,0x4A,0x49,0x49,0x30, 0x01,0x71,0x09,0x05,0x03,
+  0x36,0x49,0x49,0x49,0x36, 0x06,0x49,0x49,0x29,0x1E, 0x00,0x36,0x36,0x00,0x00, 0x00,0x56,0x36,0x00,0x00,
+  0x08,0x14,0x22,0x41,0x00, 0x14,0x14,0x14,0x14,0x14, 0x00,0x41,0x22,0x14,0x08, 0x02,0x01,0x51,0x09,0x06,
+  0x32,0x49,0x79,0x41,0x3E, 0x7E,0x11,0x11,0x11,0x7E, 0x7F,0x49,0x49,0x49,0x36, 0x3E,0x41,0x41,0x41,0x22,
+  0x7F,0x41,0x41,0x22,0x1C, 0x7F,0x49,0x49,0x49,0x41, 0x7F,0x09,0x09,0x09,0x01, 0x3E,0x41,0x49,0x49,0x7A,
+  0x7F,0x08,0x08,0x08,0x7F, 0x00,0x41,0x7F,0x41,0x00, 0x20,0x40,0x41,0x3F,0x01, 0x7F,0x08,0x14,0x22,0x41,
+  0x7F,0x40,0x40,0x40,0x40, 0x7F,0x02,0x0C,0x02,0x7F, 0x7F,0x04,0x08,0x10,0x7F, 0x3E,0x41,0x41,0x41,0x3E,
+  0x7F,0x09,0x09,0x09,0x06, 0x3E,0x41,0x51,0x21,0x5E, 0x7F,0x09,0x19,0x29,0x46, 0x46,0x49,0x49,0x49,0x31,
+  0x01,0x01,0x7F,0x01,0x01, 0x3F,0x40,0x40,0x40,0x3F, 0x1F,0x20,0x40,0x20,0x1F, 0x7F,0x20,0x18,0x20,0x7F,
+  0x63,0x14,0x08,0x14,0x63, 0x07,0x08,0x70,0x08,0x07, 0x61,0x51,0x49,0x45,0x43
+};
+
+void oled_render_char(int x, int page, char c) {
+  if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
+  if (c < 32 || c > 90) c = ' ';
+  int idx = (c - 32) * 5;
+  for (int i = 0; i < 5; i++)
+    if (x + i < 128) oled_buffer[page * 128 + x + i] = pgm_read_byte(&font5x7[idx + i]);
+}
+
+void oled_draw_string(int x, int page, const char* str) {   // max 21 chars per line
+  int cx = x;
+  while (*str && cx < 124) { oled_render_char(cx, page, *str++); cx += 6; }
+}
+
+void oledPrintf(int x, int row, const char* fmt, ...) {
+  char b[48];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(b, sizeof(b), fmt, ap);
+  va_end(ap);
+  oled_draw_string(x, row, b);
+}
+
+void oled_send_buffer() {
+  ssd1306_cmd(0x21); ssd1306_cmd(0); ssd1306_cmd(127);   // column range
+  ssd1306_cmd(0x22); ssd1306_cmd(0); ssd1306_cmd(7);     // page range
+  for (int i = 0; i < 1024; i += 32) {
+    if (i > 0) readMPU6050();                        // sample after EVERY chunk so a short knock is never missed during a redraw
+    Wire.beginTransmission(oledAddress);
+    Wire.write(0x40);
+    Wire.write(&oled_buffer[i], 32);
+    if (Wire.endTransmission() != 0) {
+      if (++oledFail >= 2) { oledAvailable = false; recoverI2CBus(); Serial.println("[OLED] Re-syncing display after power switch..."); }
+      return;
+    }
+  }
+  oledFail = 0;
+}
+
+static const uint8_t oled_init_seq[] PROGMEM = {
+  0xAE, 0xD5, 0x80, 0xA8, 0x3F, 0xD3, 0x00, 0x40,
+  0x8D, 0x14, 0x20, 0x00, 0xA1, 0xC8, 0xDA, 0x12,
+  0x81, 0xCF, 0xD9, 0xF1, 0xDB, 0x40, 0xA4, 0xA6, 0xAF
+};
+void oledSendInit() {
+  for (size_t i = 0; i < sizeof(oled_init_seq); i++) ssd1306_cmd(pgm_read_byte(&oled_init_seq[i]));
+}
+
+void initOLED() {
+  Wire.beginTransmission(0x3C); byte e3C = Wire.endTransmission();
+  Wire.beginTransmission(0x3D); byte e3D = Wire.endTransmission();
+  if (e3C == 0)      oledAddress = 0x3C;
+  else if (e3D == 0) oledAddress = 0x3D;
+  else { oledAvailable = false; return; }
+
+  oledSendInit();
+  oledAvailable = true;
+  oledFail = 0;
+  Serial.printf("[OLED] SSD1306 ready at 0x%02X\n", oledAddress);
+
+  memset(oled_buffer, 0, sizeof(oled_buffer));
+  oled_draw_string(14, 1, "AEGIS RIDE IOT");
+  oled_draw_string(8, 3, "SPEED BREAKER AI");
+  oled_draw_string(20, 5, "STATUS: ARMED");
+  oled_send_buffer();
+  oledHoldUntil = millis() + 1500;     // non-blocking splash
+}
+
+static void gpsStatusLine(char* out, size_t n) {
+  if (hasGPSFix)                                                    snprintf(out, n, "GPS: FIX %d SATS", realSatellites);
+  else if (totalGpsBytes == 0 || millis() - lastGpsByteTime > 3000) snprintf(out, n, "GPS NO DATA-CHK WIRE");
+  else if (gpsGoodSentences == 0)                                   snprintf(out, n, "GPS BAD DATA (BAUD?)");
+  else                                                              snprintf(out, n, "GPS SEARCH SAT:%d", satsInView);
+}
+
+void updateOledTelemetry() {
+  if (!oledAvailable || millis() < oledHoldUntil) return;
+
+  if (!calibrated)                              { showOledCalibrating(); return; }
+  if (currentState == STATE_CRASH_COUNTDOWN)    { showOledCrashCountdown(countdownSeconds); return; }
+  if (currentState == STATE_SOS_DISPATCHED) {
+    if (millis() >= sosStatusShownUntilMs) {
+      currentState = STATE_NORMAL;
+    } else {
+      showOledSosDispatched();
+      return;
+    }
+  }
+  if (infoPage > 0) {
+    if (millis() >= infoPageUntil) {
+      infoPage = 0;
+      oledHoldUntil = 0;
+    } else {
+      drawInfoPage(infoPage);
+      return;
+    }
+  }
+
+  memset(oled_buffer, 0, sizeof(oled_buffer));
+  char b[32];
+
+  // Row 0: System Armed + Wi-Fi Internet Status ("WIFI:OK" or "WIFI:NO")
+  oledPrintf(2, 0, "AEGIS RIDE  WIFI:%s", (WiFi.status() == WL_CONNECTED) ? "OK" : "NO");
+
+  // Row 1: Live 3-Axis Motion (X, Y, Z in G)
+  if (mpuConnected) {
+    oledPrintf(2, 1, "X:%+.1f Y:%+.1f Z:%+.1fG", ax_g, ay_g, az_g);
+    // Row 2: Total G-Force & Dynamic Shock G
+    oledPrintf(2, 2, "G:%.2f  SHOCK:%.2fG", currentG, shockShown);
+  } else {
+    oled_draw_string(2, 1, "MPU6050 NOT FOUND");
+    oled_draw_string(2, 2, "CHECK SDA21 SCL22");
+  }
+
+  // Row 3: Signed Calibrated Tilt Angle (+ or -, 0D when resting flat!) & Speed
+  float dP = ay_g - refY, dR = ax_g - refX;
+  bool negT = (fabsf(dP) >= fabsf(dR)) ? (dP < 0.0f) : (dR < 0.0f);
+  int signedT = negT ? -(int)(tiltDev + 0.5f) : +(int)(tiltDev + 0.5f);
+  oledPrintf(2, 3, "TILT:%+dD SPD:%dKM/H", signedT, (int)curSpeedKmh());
+
+  // Row 4: Battery Percentage & Voltage
+  oledPrintf(2, 4, "BAT:%d%% (%.2fV) %s",
+             batteryPercentage, batteryVoltage, isBatteryConnected ? "" : "USB");
+
+  // Row 5: Current Rider Location Coordinates (Method 3 Auto GPS)
+  oledPrintf(2, 5, "LOC:%.4f,%.4f", getEffectiveLat(), getEffectiveLng());
+
+  // Row 6: Button Guide (1 Click=Last Event, 2 Clicks=Details, 3 Clicks=SOS)
+  oled_draw_string(2, 6, "1:EVT 2:LIST 3:SOS");
+
+  // Row 7: Saved Last Event
+  const EvtRec* e = newestEvt(0);
+  oledPrintf(2, 7, "LAST: %s", e ? e->tag : "NONE");
+
+  oled_send_buffer();
+}
+
+void showWelcomeScreen() {
+  if (!oledAvailable) return;
+  memset(oled_buffer, 0, sizeof(oled_buffer));
+  oled_draw_string(18, 0, "AEGIS RIDE");
+  oled_draw_string(10, 2, "RIDE SAFE");
+  oled_draw_string(10, 3, "RIDE SLOW");
+  oled_draw_string(2, 5, "YOUR LIFE MATTERS");
+  oled_draw_string(2, 7, "REACH HOME SAFE");
+  oled_send_buffer();
+}
+
+void showOledCalibrating() {
+  if (!oledAvailable) return;
+  memset(oled_buffer, 0, sizeof(oled_buffer));
+  oled_draw_string(12, 1, "CALIBRATING...");
+  oled_draw_string(8, 3, "KEEP BOARD FLAT");
+  oled_draw_string(8, 4, "AND STILL (2 SEC)");
+  oled_send_buffer();
+}
+
+// ---- Info pages: LAST EVENT -> RECENT LOG -> COUNTS -> SYSTEM STATUS ----
+void nextInfoPage() {
+  infoPage++;
+  if (infoPage > INFO_PAGES) { infoPage = 0; oledHoldUntil = 0; lastOledRefresh = 0; return; }
+  infoPageUntil = millis() + INFO_PAGE_MS;
+  oledHoldUntil = 0;
+  drawInfoPage(infoPage);
+}
+
+void drawInfoPage(int p) {
+  if (!oledAvailable) return;
+  memset(oled_buffer, 0, sizeof(oled_buffer));
+  char b[32];
+  const EvtRec* e = newestEvt(0);
+  bool inSosSeq = (sosPressCount > 0 && (millis() - lastSosPressMs <= SOS_SEQUENCE_WINDOW_MS));
+
+  if (p == 1) {
+    if (inSosSeq) oled_draw_string(2, 0, "SOS PRESS: 1/3 (LAST)");
+    else          oled_draw_string(2, 0, "== SAVED LAST EVENT ==");
+    if (!e) {
+      oled_draw_string(2, 2, "LAST: NONE");
+      oled_draw_string(2, 3, "NO ROAD EVENTS YET");
+    } else {
+      oled_draw_string(2, 2, e->tag);
+      oled_draw_string(2, 3, e->sub);
+      oledPrintf(2, 4, "SHOCK:%.2fG TILT:%dD", e->g, (int)(e->tilt + 0.5f));
+      unsigned long s = (millis() - e->t) / 1000;
+      if (s < 120) oledPrintf(2, 5, "TIME: %lu SEC AGO", s);
+      else         oledPrintf(2, 5, "TIME: %lu MIN AGO", s / 60);
+    }
+    oledPrintf(2, 7, "2ND CLICK: EVENT LIST");
+  } else if (p == 2) {
+    if (inSosSeq) oled_draw_string(2, 0, "SOS PRESS: 2/3 (LIST)");
+    else          oled_draw_string(2, 0, "== EVENT LIST & LOG ==");
+    if (!e) {
+      oled_draw_string(2, 2, "NO EVENTS RECORDED");
+    } else {
+      for (unsigned int i = 0; i < 3; i++) {
+        const EvtRec* r = newestEvt(i);
+        if (!r) break;
+        snprintf(b, sizeof(b), "%u.%s %.1fG", i + 1, r->tag, r->g);
+        b[21] = 0;
+        oled_draw_string(2, 1 + i, b);
+      }
+    }
+    oledPrintf(2, 4, "POT:%u/%u/%u BMP:%u", cntMinor, cntMedium, cntSevere, cntSpeedBreaker);
+    if (WiFi.status() == WL_CONNECTED) {
+      oledPrintf(2, 5, "IP:%s", WiFi.localIP().toString().c_str());
+    } else {
+      oled_draw_string(2, 5, "AP: 192.168.4.1");
+    }
+    oled_draw_string(2, 7, "3RD CLICK: SEND SOS!");
+  } else if (p == 3) {
+    oledPrintf(2, 0, "== COUNTS %d/%d ==", p, INFO_PAGES);
+    oledPrintf(2, 1, "MINOR POTHOLE  : %u", cntMinor);
+    oledPrintf(2, 2, "MEDIUM POTHOLE : %u", cntMedium);
+    oledPrintf(2, 3, "SEVERE POTHOLE : %u", cntSevere);
+    oledPrintf(2, 4, "SPEED BREAKER  : %u", cntSpeedBreaker);
+    oledPrintf(2, 5, "CRASH: %u  SOS: %u", cntCrash, cntSOS);
+    oledPrintf(2, 6, "MAX SHOCK: %.2fG", maxShockG);
+  } else {
+    oledPrintf(2, 0, "== STATUS %d/%d ==", p, INFO_PAGES);
+    gpsStatusLine(b, sizeof(b));
+    oled_draw_string(2, 1, b);
+    if (hasGPSFix)          oledPrintf(2, 2, "%.4f,%.4f", realLat, realLng);
+    else if (hasEverHadFix) oled_draw_string(2, 2, "LOC: LAST KNOWN");
+    else                    oled_draw_string(2, 2, "LOC: NOT LOCKED");
+    oledPrintf(2, 3, "SPD: %d KM/H", (int)curSpeedKmh());
+    oledPrintf(2, 4, "WIFI: %s", WiFi.status() == WL_CONNECTED ? "OK" : "OFFLINE");
+    if (isBatteryConnected) oledPrintf(2, 5, "BAT: %d%% %.2fV", batteryPercentage, batteryVoltage);
+    else                    oled_draw_string(2, 5, "BAT: USB POWERED");
+    oledPrintf(2, 6, "MPU:%s TILT:%dD", mpuConnected ? "OK" : "LOST", (int)(tiltDev + 0.5f));
+    oledPrintf(2, 7, "GPS BYTES: %lu", totalGpsBytes);
+  }
+  oled_send_buffer();
+}
+
+void showOledRoadEvent(const char* tag, const char* sub, const char* detail) {
+  if (!oledAvailable) return;
+  infoPage = 0;
+  oledHoldUntil = millis() + 2500;
+  memset(oled_buffer, 0, sizeof(oled_buffer));
+  oled_draw_string(4, 0, ">> ROAD ANOMALY <<");
+  oled_draw_string(8, 2, tag);
+  oled_draw_string(8, 3, sub);
+  oled_draw_string(8, 5, detail);
+  oled_send_buffer();
+}
+
+void showOledImpact(float g) {
+  if (!oledAvailable) return;
+  infoPage = 0;
+  memset(oled_buffer, 0, sizeof(oled_buffer));
+  oled_draw_string(4, 0, ">> HARD IMPACT <<");
+  oledPrintf(4, 2, "SHOCK: %.1fG", g);
+  oledPrintf(4, 3, "TILT NOW: %d DEG", (int)(tiltDev + 0.5f));
+  oledPrintf(4, 5, "CRASH IF TILT >%d", (int)crashTiltThreshold);
+  oled_send_buffer();
+}
+
+void showOledCrashCountdown(int sec) {
+  if (!oledAvailable) return;
+  memset(oled_buffer, 0, sizeof(oled_buffer));
+  if (strstr(crashReason, "3-CLICK") != NULL || strstr(crashReason, "MANUAL") != NULL) {
+    oled_draw_string(4, 0, "! SOS COUNTDOWN !");
+  } else {
+    oled_draw_string(4, 0, "! CRASH DETECTED !");
+  }
+  oledPrintf(14, 2, "SOS IN: %d SEC", sec);
+  oled_draw_string(4, 3, crashReason);
+  oledPrintf(4, 4, "%.1fG  TILT %d DEG", crashPeakG, (int)(crashTilt + 0.5f));
+  oled_draw_string(4, 6, "PRESS BUTTON=OFF");
+  oled_send_buffer();
+}
+
+void showOledCancel() {
+  if (!oledAvailable) return;
+  infoPage = 0;
+  oledHoldUntil = millis() + 2500;
+  memset(oled_buffer, 0, sizeof(oled_buffer));
+  oled_draw_string(10, 1, ">> SAFEGUARD <<");
+  oled_draw_string(20, 3, "RIDER CANCELLED");
+  oled_draw_string(12, 5, "NO SOS SENT");
+  oled_send_buffer();
+}
+
+void showOledDismiss() {
+  if (!oledAvailable) return;
+  infoPage = 0;
+  oledHoldUntil = millis() + 2500;
+  memset(oled_buffer, 0, sizeof(oled_buffer));
+  oled_draw_string(10, 1, ">> SOS CLOSED <<");
+  oled_draw_string(10, 3, "ALERT WAS SENT");
+  oled_draw_string(10, 5, "SYSTEM RE-ARMED");
+  oled_send_buffer();
+}
+
+void showOledSosPress2() {
+  drawInfoPage(2);
+}
+
+void showOledSosDispatched() {
+  if (!oledAvailable) return;
+  memset(oled_buffer, 0, sizeof(oled_buffer));
+  oled_draw_string(6, 0, ">> EMERGENCY SOS <<");
+  oled_draw_string(2, 2, sosStatus);
+  oled_draw_string(2, 3, sosDetail);
+  oledPrintf(2, 4, "LOC:%.4f,%.4f", getEffectiveLat(), getEffectiveLng());
+  const EvtRec* e = newestEvt(0);
+  oledPrintf(2, 5, "LAST: %s", e ? e->tag : "NONE");
+  oled_draw_string(2, 7, "AUTO-CLEAR IN 10S");
+  oled_send_buffer();
+}
