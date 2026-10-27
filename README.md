@@ -1,21 +1,21 @@
-🛡️ AEGIS RIDE
+# 🛡️ AEGIS RIDE
 
-Smart Vehicle Safety & Road Condition Telemetry System
+### Smart Vehicle Safety & Road Condition Telemetry System
 
-An ESP32-based IoT project for road-event monitoring, crash detection, rider alerts, and emergency SOS communication.**
+**An ESP32-based IoT project for road-event monitoring, crash detection, rider alerts, and emergency SOS communication.**
 
-##👥 Project Authors
+## 👥 Project Authors
 
-Thillai Nathan
-Fathima Asrah
+* **Thillai Nathan**
+* **Fathima Asrah**
 
-📌 About the Project
+## 📌 About the Project
 
 AEGIS RIDE is an IoT-based vehicle safety prototype designed to monitor vehicle motion, identify potential road hazards, and assist riders during emergency situations.
 
 The system uses an ESP32 microcontroller to process sensor readings, display information on an OLED screen, and provide a web-based dashboard for monitoring vehicle telemetry. When an emergency is triggered, the system can attempt to send an SOS alert through Telegram when an internet connection is available.
 
-🎯 Objectives
+## 🎯 Objectives
 
 * Detect and classify road impacts using motion-sensor data.
 * Identify speed breakers and significant vehicle tilting.
@@ -25,7 +25,7 @@ The system uses an ESP32 microcontroller to process sensor readings, display inf
 * Display live telemetry and recent events on a mobile-friendly dashboard.
 * Send emergency notifications through Telegram when connectivity permits.
 
- 🧰 Hardware Components
+## 🧰 Hardware Components
 
 | Component               | Purpose                                   |
 | ----------------------- | ----------------------------------------- |
@@ -37,7 +37,7 @@ The system uses an ESP32 microcontroller to process sensor readings, display inf
 | Push button             | Manual control and SOS interaction        |
 | Battery voltage divider | Battery-voltage measurement               |
 
-💻 Software and Technologies
+## 💻 Software and Technologies
 
 * Arduino IDE
 * ESP32 Arduino framework
@@ -48,7 +48,7 @@ The system uses an ESP32 microcontroller to process sensor readings, display inf
 * Telegram Bot API
 * Google Maps location links
 
- ⚙️ System Workflow
+## ⚙️ System Workflow
 
 1. The ESP32 initializes the sensors and display.
 2. The MPU6050 supplies acceleration and orientation measurements.
@@ -58,7 +58,7 @@ The system uses an ESP32 microcontroller to process sensor readings, display inf
 6. The firmware attempts Telegram delivery when internet access is available.
 7. The rider can cancel an eligible countdown or dismiss the displayed SOS status.
 
- 🌐 Web Dashboard
+## 🌐 Web Dashboard
 
 The dashboard implemented in the firmware provides:
 
@@ -74,7 +74,7 @@ The dashboard implemented in the firmware provides:
 
 Remote Telegram delivery requires a separate working internet connection for the ESP32. Local dashboard access alone does not guarantee that an emergency message will reach another person.
 
-🔌 Pin Connections
+## 🔌 Pin Connections
 
 | Module          | ESP32 connection                           |
 | --------------- | ------------------------------------------ |
@@ -88,7 +88,7 @@ Remote Telegram delivery requires a separate working internet connection for the
 | Push button     | GPIO 4 and GND                             |
 | Battery sensing | GPIO 34 through a suitable voltage divider |
 
-🚀 Setup Instructions
+## 🚀 Setup Instructions
 
 1. Install the Arduino IDE and ESP32 board support.
 2. Open the project firmware in the Arduino IDE.
@@ -101,7 +101,7 @@ Remote Telegram delivery requires a separate working internet connection for the
 9. Open `http://192.168.4.1` to access the dashboard.
 10. Test each feature individually before performing integrated tests.
 
- 🧪 Testing and Validation
+## 🧪 Testing and Validation
 
 Record the actual results of these tests:
 
@@ -117,7 +117,7 @@ Record the actual results of these tests:
 
 Do not report detection accuracy or successful emergency delivery until the corresponding tests have been completed.
 
- 🔐 Security Considerations
+## 🔐 Security Considerations
 
 * Keep Wi-Fi passwords and Telegram tokens out of public source code.
 * Use certificate verification for HTTPS requests.
@@ -125,7 +125,7 @@ Do not report detection accuracy or successful emergency delivery until the corr
 * Test the system in a controlled environment.
 * Do not rely on this academic prototype as the sole means of emergency protection.
 
- 🔮 Future Enhancements
+## 🔮 Future Enhancements
 
 * Improve crash-detection reliability through repeated testing.
 * Add persistent event history and downloadable reports.
@@ -135,6 +135,6 @@ Do not report detection accuracy or successful emergency delivery until the corr
 * Improve dashboard accessibility and responsive design.
 * Evaluate detection performance using recorded test data.
 
- ⚠️ Disclaimer
+## ⚠️ Disclaimer
 
 AEGIS RIDE is an academic prototype. Its alerts, sensor readings, location estimates, and network delivery depend on hardware performance and connectivity. It is not a certified vehicle safety or emergency-response system.
