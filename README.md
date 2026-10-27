@@ -4,7 +4,7 @@ Smart Vehicle Safety & Road Condition Telemetry System
 
 An ESP32-based IoT project for road-event monitoring, crash detection, rider alerts, and emergency SOS communication.**
 
-👥 Project Authors
+##👥 Project Authors
 
 Thillai Nathan
 Fathima Asrah
