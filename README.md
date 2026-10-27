@@ -6,8 +6,8 @@ An ESP32-based IoT project for road-event monitoring, crash detection, rider ale
 
 👥 Project Authors
 
-**Thillai Nathan**
-**Fathima Asrah**
+Thillai Nathan
+Fathima Asrah
 
 📌 About the Project
 
