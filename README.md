@@ -1,18 +1,26 @@
 # 🛡️ AEGIS RIDE
 ### Smart Vehicle Safety & Road Condition Telemetry System
 
+![ESP32](https://img.shields.io/badge/ESP32-E7352C?style=for-the-badge&logo=espressif&logoColor=white)
+![C++](https://img.shields.io/badge/C%2B%2B-00599C?style=for-the-badge&logo=c%2B%2B&logoColor=white)
+![Arduino](https://img.shields.io/badge/Arduino_IDE-00979D?style=for-the-badge&logo=Arduino&logoColor=white)
+![HTML5](https://img.shields.io/badge/HTML5-E34F26?style=for-the-badge&logo=html5&logoColor=white)
+![CSS3](https://img.shields.io/badge/CSS3-1572B6?style=for-the-badge&logo=css3&logoColor=white)
+![JavaScript](https://img.shields.io/badge/JavaScript-F7DF1E?style=for-the-badge&logo=javascript&logoColor=black)
+![Telegram](https://img.shields.io/badge/Telegram_Bot_API-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)
+
 **An ESP32-based IoT project for road-event monitoring, crash detection, rider alerts, and emergency SOS communication.**
 
 ## 👥 Project Authors
 
 | Profile | Author Name | GitHub Profile |
 | :---: | :--- | :--- |
-| <img src="https://github.com/thillainathan786.png" width="60" style="border-radius:50%"/> | **Thillai Nathan** | [@thillainathan786](https://github.com/thillainathan786) |
+| <img src="https://github.com/thillai-nathan.png" width="60" style="border-radius:50%"/> | **Thillai Nathan** | [@thillai-nathan](https://github.com/thillai-nathan) |
 | <img src="https://github.com/fathimaaaaa3.png" width="60" style="border-radius:50%"/> | **Fathima Asrah** | [@fathimaaaaa3](https://github.com/fathimaaaaa3) |
 
 ### 🤝 Contributors
-<a href="https://github.com/thillainathan786/aegis-ride/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=thillainathan786/aegis-ride" />
+<a href="https://github.com/thillai-nathan/aegis-ride/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=thillai-nathan/aegis-ride" />
 </a>
 
 ## 📌 About the Project
