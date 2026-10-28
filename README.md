@@ -20,43 +20,52 @@
 
 ## 👥 Project Authors
 
-| Profile | Author Name | Role & Focus | GitHub Profile |
-| :---: | :--- | :--- | :--- |
-| <img src="https://github.com/thillai-nathan.png" width="60" style="border-radius:50%"/> | **Thillai Nathan** | Embedded Firmware, Telemetry & IoT Architecture | [@thillai-nathan](https://github.com/thillai-nathan) |
-| <img src="https://github.com/fathimaaaaa3.png" width="60" style="border-radius:50%"/> | **Fathima Asrah** | Hardware Integration, Validation & Documentation | [@fathimaaaaa3](https://github.com/fathimaaaaa3) |
+| Profile | Name | GitHub ID |
+| :---: | :--- | :--- |
+| <img src="https://github.com/thillai-nathan.png" width="60" style="border-radius:50%"/> | **Thillai Nathan** | [@thillai-nathan](https://github.com/thillai-nathan) |
+| <img src="https://github.com/fathimaaaaa3.png" width="60" style="border-radius:50%"/> | **Fathima Asrah** | [@fathimaaaaa3](https://github.com/fathimaaaaa3) |
 
 ### 🤝 Contributors
-<a href="https://github.com/thillai-nathan/aegis-ride/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=thillai-nathan/aegis-ride" />
-</a>
+<p align="left">
+  <a href="https://github.com/thillai-nathan">
+    <img src="https://github.com/thillai-nathan.png" width="55" height="55" style="border-radius:50%" alt="thillai-nathan"/>
+  </a>
+  &nbsp;&nbsp;
+  <a href="https://github.com/fathimaaaaa3">
+    <img src="https://github.com/fathimaaaaa3.png" width="55" height="55" style="border-radius:50%" alt="fathimaaaaa3"/>
+  </a>
+</p>
 
 ---
 
 ## 📌 About the Project
 
-**AEGIS RIDE** is an IoT-based vehicle safety prototype designed to monitor vehicle motion, identify potential road hazards, and assist riders during emergency situations.
+AEGIS RIDE is an IoT-based vehicle safety prototype designed to monitor vehicle motion, identify potential road hazards, and assist riders during emergency situations.
 
-The system uses an **ESP32 microcontroller** to process sensor readings, display information on an OLED screen, and provide a web-based dashboard for monitoring vehicle telemetry. When an emergency is triggered, the system can attempt to send an SOS alert through Telegram when an internet connection is available.
+The system uses an ESP32 microcontroller to process sensor readings, display information on an OLED screen, and provide a web-based dashboard for monitoring vehicle telemetry. When an emergency is triggered, the system can attempt to send an SOS alert through Telegram when an internet connection is available.
 
 ---
 
 ## 🏗️ System Architecture
 
-```mermaid
-graph LR
-    subgraph Inputs [Sensor & Input Layer]
-        A[MPU6050 Accel/Gyro] -->|I2C GPIO 21/22| E[ESP32 Controller]
-        B[NEO-6M GPS] -->|UART GPIO 16/17| E
-        C[Push Button] -->|GPIO 4| E
-        D[Battery Divider] -->|ADC GPIO 34| E
-    end
+```text
+  [1. INPUT SENSORS]               [2. CONTROLLER]               [3. OUTPUTS & ALERTS]
 
-    subgraph Outputs [Alert & Telemetry Layer]
-        E -->|I2C GPIO 21/22| F[SSD1306 OLED Display]
-        E -->|GPIO 25| G[Active Buzzer]
-        E -->|Wi-Fi AP 192.168.4.1| H[Mobile Web Dashboard]
-        E -->|HTTPS / Wi-Fi STA| I[Telegram SOS Bot]
-    end
++--------------------+                                         +-----------------------+
+|   MPU6050 Sensor   |---(Motion & Tilt)---+              +--->|  SSD1306 OLED Screen  |
++--------------------+                     |              |    +-----------------------+
+                                           v              |
++--------------------+             +---------------+      |    +-----------------------+
+|   NEO-6M GPS       |---(Location)--->|               |------+--->|  Warning Buzzer       |
++--------------------+             |     ESP32     |      |    +-----------------------+
+                                   | Microcontroller|      |
++--------------------+             |               |------+--->+-----------------------+
+|   SOS Push Button  |---(Manual)----->|               |      |    |  Live Web Dashboard   |
++--------------------+             +---------------+      |    +-----------------------+
+                                           ^              |
++--------------------+                     |              |    +-----------------------+
+|      Battery       |---(Power / Sense)---+              +--->|  Telegram SOS Alert   |
++--------------------+                                         +-----------------------+
 ```
 
 ---
@@ -65,7 +74,7 @@ graph LR
 
 - Detect and classify road impacts using motion-sensor data.
 - Identify speed breakers and significant vehicle tilting.
-- Monitor vehicle movement and available battery information.
+- Monitor vehicle movement and battery status.
 - Obtain rider coordinates using a GPS module or supported phone-location integration.
 - Provide a manual SOS trigger and countdown cancellation.
 - Display live telemetry and recent events on a mobile-friendly dashboard.
@@ -83,7 +92,7 @@ graph LR
 | SSD1306 OLED | Local status and event display |
 | Buzzer | Audible warnings |
 | Push button | Manual control and SOS interaction |
-| Battery voltage divider | Battery-voltage measurement |
+| Battery | Power supply and monitoring |
 
 ---
 
@@ -118,7 +127,7 @@ The dashboard implemented in the firmware provides:
 
 - Live sensor telemetry
 - Emergency SOS and cancellation controls
-- Battery information
+- Battery status
 - GPS and location information
 - Google Maps link
 - Recent event history
@@ -142,7 +151,7 @@ Remote Telegram delivery requires a separate working internet connection for the
 | GPS RX | GPIO 17 (ESP32 TX2) |
 | Buzzer positive | GPIO 25 |
 | Push button | GPIO 4 and GND |
-| Battery sensing | GPIO 34 through a suitable voltage divider |
+| Battery connection | GPIO 34 (via divider) |
 
 ---
 
@@ -173,7 +182,7 @@ Record the actual results of these tests:
 - Countdown cancellation
 - Telegram delivery with internet access
 - Dashboard operation during sensor activity
-- Battery-voltage measurement
+- Battery monitoring
 
 Do not report detection accuracy or successful emergency delivery until the corresponding tests have been completed.
 
